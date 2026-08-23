@@ -115,14 +115,17 @@ module.exports = {
       alias: Object.assign({
         '@': resolve('src'),
         // ===== Univer 兼容性别名 (解决 Webpack 4 不支持 package exports 字段) =====
-        // @univerjs/*/facade 子路径别名 (facade 入口被内部代码引用)
-        '@univerjs/core/facade$': resolve('node_modules/@univerjs/core/lib/cjs/facade.js'),
-        '@univerjs/sheets/facade$': resolve('node_modules/@univerjs/sheets/lib/cjs/facade.js'),
-        '@univerjs/sheets-ui/facade$': resolve('node_modules/@univerjs/sheets-ui/lib/cjs/facade.js'),
-        '@univerjs/engine-formula/facade$': resolve('node_modules/@univerjs/engine-formula/lib/cjs/facade.js'),
-        '@univerjs/network/facade$': resolve('node_modules/@univerjs/network/lib/cjs/facade.js'),
-        '@univerjs/docs-ui/facade$': resolve('node_modules/@univerjs/docs-ui/lib/cjs/facade.js'),
-        '@univerjs/rpc/facade$': resolve('node_modules/@univerjs/rpc/lib/cjs/facade.js'),
+        // 关键：facade 子路径必须指向 ES 根文件 lib/facade.js，与 @univerjs/presets
+        // 实际 import 的 "@univerjs/core/lib/facade" 解析到同一个文件。否则会产生
+        // 两个不同的 FUniver 类：presets 用的是 ES 根 FUniver，而 sheets facade
+        // 通过 alias 拿到的是 CJS FUniver，导致 FUniver.extend(FUniverSheetsMixin)
+        // 扩展了错误的类，univerAPI.getActiveWorkbook() 恒为 undefined。
+        '@univerjs/core/facade$': resolve('node_modules/@univerjs/core/lib/facade.js'),
+        '@univerjs/sheets/facade$': resolve('node_modules/@univerjs/sheets/lib/facade.js'),
+        '@univerjs/sheets-ui/facade$': resolve('node_modules/@univerjs/sheets-ui/lib/facade.js'),
+        '@univerjs/engine-formula/facade$': resolve('node_modules/@univerjs/engine-formula/lib/facade.js'),
+        '@univerjs/network/facade$': resolve('node_modules/@univerjs/network/lib/facade.js'),
+        '@univerjs/docs-ui/facade$': resolve('node_modules/@univerjs/docs-ui/lib/facade.js'),
         // @wendellhu/redi react-bindings (Univer 内部依赖)
         '@wendellhu/redi/react-bindings$': resolve('node_modules/@wendellhu/redi/dist/cjs/react-bindings/index.js'),
         // 纯 ESM 包 (只有 exports 字段，无 main/module，Webpack 4 无法解析)

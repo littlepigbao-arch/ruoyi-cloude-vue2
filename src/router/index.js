@@ -80,6 +80,14 @@ export const constantRoutes = [
     hidden: true,
     meta: { title: '锁定屏幕' }
   },
+  // ===== 临时：AI 表格助手验证路由（不走 Layout，免登录态依赖） =====
+  {
+    path: '/agent-report',
+    component: () => import('@/views/application/agentReport/index'),
+    name: 'AgentReport',
+    hidden: true,
+    meta: { title: 'AI 表格助手' }
+  },
   {
     path: '/user',
     component: Layout,

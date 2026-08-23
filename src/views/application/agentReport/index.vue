@@ -62,6 +62,16 @@
     <div class="univer-container">
       <div ref="univerContainer" id="univer-container" class="univer-wrapper"></div>
     </div>
+
+    <!-- AI 助手悬浮面板 -->
+    <ai-chat-panel
+      :univerAPI="univerAPI"
+      :workbook="activeWorkbook"
+      :visible.sync="aiPanelVisible"
+      :use-mock.sync="aiUseMock"
+      :allow-mock-fallback="true"
+      @executed="onAiExecuted"
+    />
   </div>
 </template>
 
@@ -87,12 +97,19 @@ import '@univerjs/presets/lib/styles/preset-sheets-conditional-formatting.css'
 import '@univerjs/presets/lib/styles/preset-sheets-filter.css'
 import '@univerjs/presets/lib/styles/preset-sheets-drawing.css'
 
+// 注册 sheets facade mixin（FUniverSheetsMixin），让 univerAPI.getActiveWorkbook() 可用
+// 否则 FUniver 只有 core 方法，getActiveWorkbook/createWorkbook 等均 undefined
+// 这行 import 的副作用会执行 FUniver.extend(FUniverSheetsMixin)，挂载 FWorkbook/FWorksheet/FRange 的完整方法
+import '@univerjs/sheets/lib/es/facade.js'
+
 import LuckyExcel from 'luckyexcel'
 import * as XLSX from 'xlsx'
 import { saveAs } from 'file-saver'
+import AiChatPanel from './components/AiChatPanel.vue'
 
 export default {
   name: 'ApplicationExcel',
+  components: { AiChatPanel },
   data() {
     return {
       showSearch: false,
@@ -100,7 +117,12 @@ export default {
       univer: null,
       univerAPI: null,
       hasData: false,
-      currentWorkbookId: null
+      currentWorkbookId: null,
+      // createUnit() 返回的 workbook 引用（FWorkbook），传给 AI 执行器操控
+      activeWorkbook: null,
+      // AI 助手面板状态
+      aiPanelVisible: true,
+      aiUseMock: true
     }
   },
   mounted() {
@@ -162,6 +184,7 @@ export default {
         }
         this.univer = null
         this.univerAPI = null
+        this.activeWorkbook = null
       }
     },
 
@@ -430,6 +453,8 @@ export default {
         }
 
         const workbook = this.univer.createUnit(UniverInstanceType.UNIVER_SHEET, workbookData)
+        // 优先用 facade FWorkbook（含 setValue/merge 等方法），facade 不可用时退回核心 workbook
+        this.activeWorkbook = (this.univerAPI.getActiveWorkbook && this.univerAPI.getActiveWorkbook()) || workbook
         if (workbook && typeof workbook.getUnitId === 'function') {
           this.currentWorkbookId = workbook.getUnitId()
         } else if (workbookData.id) {
@@ -505,8 +530,9 @@ export default {
           sheetOrder.push(sheetId)
 
           const cellData = {}
-          const rowCount = sheet.getRowCount()
-          const colCount = sheet.getColumnCount()
+          // 兼容 facade（getMaxRows/getMaxColumns）与核心（getRowCount/getColumnCount）
+          const rowCount = typeof sheet.getMaxRows === 'function' ? sheet.getMaxRows() : sheet.getRowCount()
+          const colCount = typeof sheet.getMaxColumns === 'function' ? sheet.getMaxColumns() : sheet.getColumnCount()
 
           for (let r = 0; r < Math.min(rowCount, 5000); r++) {
             for (let c = 0; c < Math.min(colCount, 500); c++) {
@@ -528,7 +554,7 @@ export default {
 
           sheets[sheetId] = {
             id: sheetId,
-            name: sheet.getName() || ('Sheet' + (index + 1)),
+            name: (typeof sheet.getSheetName === 'function' ? sheet.getSheetName() : sheet.getName()) || ('Sheet' + (index + 1)),
             rowCount: rowCount,
             columnCount: colCount,
             cellData: cellData
@@ -693,6 +719,7 @@ export default {
           }
         }
         this.currentWorkbookId = null
+        this.activeWorkbook = null
         this.hasData = false
         this.statusMessage = '数据已清空，请导入Excel文件或新建表格'
         this.$modal.msgSuccess('清空成功')
@@ -708,6 +735,18 @@ export default {
       const min = String(date.getMinutes()).padStart(2, '0')
       const s = String(date.getSeconds()).padStart(2, '0')
       return y + m + d + '_' + h + min + s
+    },
+
+    /** AI 执行结果回调：把执行概要刷到顶部状态条 */
+    onAiExecuted(exec) {
+      if (!exec || !exec.summary) return
+      const s = exec.summary
+      const ok = s.ok || 0
+      const failed = s.failed || 0
+      let msg = 'AI 执行完成：成功 ' + ok + ' 条'
+      if (failed > 0) msg += '，失败 ' + failed + ' 条'
+      if (exec.notes && exec.notes.length) msg += '（' + exec.notes.join('；') + '）'
+      this.statusMessage = msg
     }
   }
 }
