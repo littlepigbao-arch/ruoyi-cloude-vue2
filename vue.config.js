@@ -1,5 +1,6 @@
 'use strict'
 const path = require('path')
+const fs = require('fs')
 
 function resolve(dir) {
   return path.join(__dirname, dir)
@@ -10,6 +11,50 @@ const CompressionPlugin = require('compression-webpack-plugin')
 const name = process.env.VUE_APP_TITLE || '若依管理系统' // 网页标题
 
 const port = process.env.port || process.env.npm_config_port || 80 // 端口
+
+// ===== Univer 兼容性辅助：动态生成别名 =====
+// 背景：Webpack 4 (Vue CLI 4) 不支持 package.json 的 exports 字段，
+// 而 @univerjs 各子包、@radix-ui/*、cjk-regex 等纯 ESM 包依赖 exports
+// 字段暴露子路径/入口，导致构建期 "Module not found"。这里通过 fs 扫描
+// node_modules，自动为 locale/locales 子路径和 @radix-ui 子路径生成别名。
+function buildUniverAliases() {
+  const alias = {}
+  // 1) @univerjs 子包的 locale/locales 子路径 (zh-CN)
+  const univerRoot = resolve('node_modules/@univerjs')
+  if (fs.existsSync(univerRoot)) {
+    fs.readdirSync(univerRoot, { withFileTypes: true }).forEach(entry => {
+      if (!entry.isDirectory()) return
+      const pkg = entry.name
+      const localeSingle = resolve(`node_modules/@univerjs/${pkg}/lib/cjs/locale/zh-CN.js`)
+      if (fs.existsSync(localeSingle)) {
+        alias[`@univerjs/${pkg}/locale/zh-CN`] = localeSingle
+      }
+      const localePlural = resolve(`node_modules/@univerjs/${pkg}/lib/cjs/locales/zh-CN.js`)
+      if (fs.existsSync(localePlural)) {
+        alias[`@univerjs/${pkg}/locales/zh-CN`] = localePlural
+      }
+    })
+  }
+  // 2) @radix-ui/* 子路径 (Webpack 4 无法解析其 exports 条件字段)
+  const radixRoot = resolve('node_modules/@radix-ui')
+  if (fs.existsSync(radixRoot)) {
+    fs.readdirSync(radixRoot, { withFileTypes: true }).forEach(entry => {
+      if (!entry.isDirectory()) return
+      const pkg = entry.name
+      // 2.1 @radix-ui/<pkg>/is-development 子路径
+      const isDevCjs = resolve(`node_modules/@radix-ui/${pkg}/dist/internal/is-development.${process.env.NODE_ENV === 'production' ? 'false' : 'true'}.js`)
+      const isDevCjsFallback = resolve(`node_modules/@radix-ui/${pkg}/dist/internal/is-development.false.js`)
+      if (fs.existsSync(isDevCjs)) {
+        alias[`@radix-ui/${pkg}/is-development`] = isDevCjs
+      } else if (fs.existsSync(isDevCjsFallback)) {
+        alias[`@radix-ui/${pkg}/is-development`] = isDevCjsFallback
+      }
+    })
+  }
+  return alias
+}
+
+const univerAliases = buildUniverAliases()
 
 // vue.config.js 配置说明
 //官方vue.config.js 参考文档 https://cli.vuejs.org/zh/config/#css-loaderoptions
@@ -25,7 +70,21 @@ module.exports = {
   assetsDir: 'static',
   // 如果你不需要生产环境的 source map，可以将其设置为 false 以加速生产环境构建。
   productionSourceMap: false,
-  transpileDependencies: ['quill'],
+  transpileDependencies: [
+    'quill',
+    // ===== Univer 相关依赖需要转译 ES6+ 新语法 (??, class fields, etc.) =====
+    '@univerjs',
+    '@wendellhu',
+    'numfmt',
+    'cjk-regex',
+    'regexp-util',
+    'unicode-regex',
+    'lodash-es',
+    // Univer UI 依赖的 React 生态 ESM 包 (含 .mjs 文件 + class fields 语法)
+    '@radix-ui',
+    'class-variance-authority',
+    'tailwind-merge'
+  ],
   // webpack-dev-server 相关配置
   devServer: {
     host: '0.0.0.0',
@@ -53,9 +112,24 @@ module.exports = {
   configureWebpack: {
     name: name,
     resolve: {
-      alias: {
-        '@': resolve('src')
-      }
+      alias: Object.assign({
+        '@': resolve('src'),
+        // ===== Univer 兼容性别名 (解决 Webpack 4 不支持 package exports 字段) =====
+        // @univerjs/*/facade 子路径别名 (facade 入口被内部代码引用)
+        '@univerjs/core/facade$': resolve('node_modules/@univerjs/core/lib/cjs/facade.js'),
+        '@univerjs/sheets/facade$': resolve('node_modules/@univerjs/sheets/lib/cjs/facade.js'),
+        '@univerjs/sheets-ui/facade$': resolve('node_modules/@univerjs/sheets-ui/lib/cjs/facade.js'),
+        '@univerjs/engine-formula/facade$': resolve('node_modules/@univerjs/engine-formula/lib/cjs/facade.js'),
+        '@univerjs/network/facade$': resolve('node_modules/@univerjs/network/lib/cjs/facade.js'),
+        '@univerjs/docs-ui/facade$': resolve('node_modules/@univerjs/docs-ui/lib/cjs/facade.js'),
+        '@univerjs/rpc/facade$': resolve('node_modules/@univerjs/rpc/lib/cjs/facade.js'),
+        // @wendellhu/redi react-bindings (Univer 内部依赖)
+        '@wendellhu/redi/react-bindings$': resolve('node_modules/@wendellhu/redi/dist/cjs/react-bindings/index.js'),
+        // 纯 ESM 包 (只有 exports 字段，无 main/module，Webpack 4 无法解析)
+        'cjk-regex$': resolve('node_modules/cjk-regex/lib/index.js'),
+        'regexp-util$': resolve('node_modules/regexp-util/lib/index.js'),
+        'unicode-regex$': resolve('node_modules/unicode-regex/lib/index.js')
+      }, univerAliases)
     },
     plugins: [
       // http://doc.ruoyi.vip/ruoyi-vue/other/faq.html#使用gzip解压缩静态文件
@@ -72,6 +146,25 @@ module.exports = {
   chainWebpack(config) {
     config.plugins.delete('preload') // TODO: need test
     config.plugins.delete('prefetch') // TODO: need test
+
+    // ===== 修复 .mjs 文件在 Webpack 4 下 strict ESM → "require is not defined" =====
+    // Webpack 4 默认把 .mjs 扩展名自动判定为 module.type = "javascript/esm"
+    // (strict ESM，禁用 require/module.exports)。但 class-variance-authority、
+    // @radix-ui/react-* 等 Univer 依赖的 .mjs 会 import clsx 等 CJS 包，
+    // Webpack 在 ESM↔CJS interop 时会生成 require() 桥接 → strict ESM 下崩。
+    // 解决：为 node_modules 下的所有 .mjs 加一条"纯类型"规则（不加 loader），
+    // 显式声明 module.type = "javascript/auto"（同时允许 ESM import/export 与
+    // CJS require/module.exports）。babel 转译仍走 Vue CLI 默认 js rule
+    // (test: /\.m?jsx?$/)，不双转译、不影响行为。
+    config.module
+      .rule('mjs-type-fix')
+      .test(/\.mjs$/)
+      .include.add(/node_modules[\\/]/).end()
+      .type('javascript/auto')
+      .end()
+
+    // .mjs 后缀加入 resolve.extensions
+    config.resolve.extensions.prepend('.mjs')
 
     // set svg-sprite-loader
     config.module
