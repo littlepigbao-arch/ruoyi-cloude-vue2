@@ -39,6 +39,16 @@
       </el-col>
       <el-col :span="1.5">
         <el-button
+          type="primary"
+          plain
+          icon="el-icon-check"
+          size="mini"
+          @click="saveCurrentWorkbook(true)"
+          :disabled="!hasData"
+        >保存</el-button>
+      </el-col>
+      <el-col :span="1.5">
+        <el-button
           type="info"
           plain
           icon="el-icon-delete"
@@ -59,8 +69,17 @@
       class="mb8"
     />
 
-    <div class="univer-container">
-      <div ref="univerContainer" id="univer-container" class="univer-wrapper"></div>
+    <div class="content-row">
+      <document-list
+        :documents="documents"
+        :active-id="currentDocumentId"
+        @select="loadDocument"
+        @delete="deleteDocument"
+        @refresh="fetchDocuments"
+      />
+      <div class="univer-container">
+        <div ref="univerContainer" id="univer-container" class="univer-wrapper"></div>
+      </div>
     </div>
 
     <!-- AI 助手悬浮面板 -->
@@ -98,18 +117,24 @@ import '@univerjs/presets/lib/styles/preset-sheets-filter.css'
 import '@univerjs/presets/lib/styles/preset-sheets-drawing.css'
 
 // 注册 sheets facade mixin（FUniverSheetsMixin），让 univerAPI.getActiveWorkbook() 可用
-// 否则 FUniver 只有 core 方法，getActiveWorkbook/createWorkbook 等均 undefined
-// 这行 import 的副作用会执行 FUniver.extend(FUniverSheetsMixin)，挂载 FWorkbook/FWorksheet/FRange 的完整方法
-import '@univerjs/sheets/lib/es/facade.js'
+// 关键：必须用 lib/facade.js，与 @univerjs/preset-sheets-core 内部 import 的
+// "@univerjs/sheets/lib/facade" 解析到同一个文件。若误用 lib/es/facade.js，
+// 会多加载一个 FRange/FWorksheet 类，导致 FRange.extend(FRangeSheetsFilterMixin)
+// 扩展错类，运行时 fRange.getFilter()/createFilter() 恒为 undefined。
+import '@univerjs/sheets/lib/facade.js'
+// 注册 filter facade mixin（FRangeSheetsFilterMixin），让 FRange.getFilter()/createFilter() 可用
+import '@univerjs/sheets-filter/lib/facade.js'
 
 import LuckyExcel from 'luckyexcel'
 import * as XLSX from 'xlsx'
 import { saveAs } from 'file-saver'
 import AiChatPanel from './components/AiChatPanel.vue'
+import DocumentList from './components/DocumentList.vue'
+import { listWorkbooks, getWorkbook, saveWorkbook, deleteWorkbook } from '@/api/ai/workbook'
 
 export default {
   name: 'ApplicationExcel',
-  components: { AiChatPanel },
+  components: { AiChatPanel, DocumentList },
   data() {
     return {
       showSearch: false,
@@ -122,13 +147,19 @@ export default {
       activeWorkbook: null,
       // AI 助手面板状态
       aiPanelVisible: true,
-      aiUseMock: true
+      aiUseMock: false,
+      // 文档列表状态
+      documents: [],
+      currentDocumentId: null,
+      currentDocumentName: '',
+      currentDocumentType: ''
     }
   },
   mounted() {
     this.$nextTick(() => {
       this.initUniver()
     })
+    this.fetchDocuments()
   },
   beforeDestroy() {
     this.disposeUniver()
@@ -188,12 +219,146 @@ export default {
       }
     },
 
+    /** 正确销毁指定工作簿 unit（Univer 顶层无 disposeUnit，须经实例服务） */
+    disposeUnitById(unitId) {
+      if (!unitId || !this.univer) return false
+      try {
+        const instanceService = this.univer._univerInstanceService
+        if (instanceService && typeof instanceService.disposeUnit === 'function') {
+          return instanceService.disposeUnit(unitId)
+        }
+      } catch (e) {
+        console.warn('销毁工作簿时出错:', e)
+      }
+      return false
+    },
+
     /** 重新创建 Univer 实例 */
     recreateUniver() {
       this.disposeUniver()
       this.$nextTick(() => {
         this.initUniver()
       })
+    },
+
+    // ============ 文档持久化 ============
+    /** 拉取文档列表 */
+    fetchDocuments() {
+      listWorkbooks().then((res) => {
+        if (res && res.code === 200) {
+          this.documents = res.data || []
+        }
+      }).catch((e) => {
+        console.error('获取文档列表失败:', e)
+      })
+    },
+
+    /** 获取当前表格快照 */
+    getSnapshot() {
+      try {
+        const workbook = this.univerAPI.getActiveWorkbook()
+        if (!workbook) return null
+        let snapshot = null
+        try {
+          snapshot = workbook.save()
+        } catch (e) {
+          console.warn('使用 save() 获取快照失败，回退手动快照:', e)
+        }
+        if (!snapshot) snapshot = this.manualSnapshot()
+        return snapshot
+      } catch (e) {
+        console.error('获取表格快照失败:', e)
+        return null
+      }
+    },
+
+    /** 保存当前表格到后端（showMsg 控制是否弹成功/失败提示） */
+    saveCurrentWorkbook(showMsg) {
+      if (!this.hasData || !this.univerAPI) {
+        if (showMsg) this.$modal.msgWarning('没有可保存的数据')
+        return
+      }
+      const snapshot = this.getSnapshot()
+      if (!snapshot) {
+        if (showMsg) this.$modal.msgError('获取表格快照失败')
+        return
+      }
+      const payload = {
+        workbookId: this.currentDocumentId || null,
+        name: this.currentDocumentName || snapshot.name || '未命名文档',
+        type: this.currentDocumentType || 'created',
+        content: JSON.stringify(snapshot)
+      }
+      saveWorkbook(payload).then((res) => {
+        if (res && res.code === 200 && res.data) {
+          this.currentDocumentId = res.data.workbookId
+          this.currentDocumentName = res.data.name
+          this.currentDocumentType = res.data.type
+          this.statusMessage = '已保存：' + res.data.name
+          if (showMsg) this.$modal.msgSuccess('保存成功')
+          this.fetchDocuments()
+        } else {
+          if (showMsg) this.$modal.msgError((res && res.msg) || '保存失败')
+        }
+      }).catch((e) => {
+        console.error('保存文档失败:', e)
+        if (showMsg) this.$modal.msgError('保存失败：' + (e && e.message ? e.message : String(e)))
+      })
+    },
+
+    /** 打开文档 */
+    loadDocument(doc) {
+      if (!doc || !doc.workbookId) return
+      getWorkbook(doc.workbookId).then((res) => {
+        if (res && res.code === 200 && res.data) {
+          const wb = res.data
+          if (!wb.content) {
+            this.$modal.msgWarning('文档内容为空')
+            return
+          }
+          let snapshot = null
+          try {
+            snapshot = JSON.parse(wb.content)
+          } catch (e) {
+            console.error('文档内容解析失败:', e)
+            this.$modal.msgError('文档内容解析失败')
+            return
+          }
+          this.loadUniverWorkbook(snapshot)
+          this.currentDocumentId = wb.workbookId
+          this.currentDocumentName = wb.name
+          this.currentDocumentType = wb.type
+          this.statusMessage = '已打开：' + wb.name
+        } else {
+          this.$modal.msgError((res && res.msg) || '加载文档失败')
+        }
+      }).catch((e) => {
+        console.error('加载文档失败:', e)
+        this.$modal.msgError('加载文档失败')
+      })
+    },
+
+    /** 删除文档 */
+    deleteDocument(doc) {
+      if (!doc || !doc.workbookId) return
+      this.$modal.confirm('确认删除文档「' + doc.name + '」？').then(() => {
+        deleteWorkbook(doc.workbookId).then((res) => {
+          if (res && res.code === 200) {
+            this.$modal.msgSuccess('删除成功')
+            if (this.currentDocumentId === doc.workbookId) {
+              this.currentDocumentId = null
+              this.currentDocumentName = ''
+              this.currentDocumentType = ''
+            }
+            this.fetchDocuments()
+          } else {
+            this.$modal.msgError((res && res.msg) || '删除失败')
+          }
+        }).catch((e) => {
+          console.error('删除文档失败:', e)
+          this.$modal.msgError('删除失败')
+        })
+      }).catch(() => {})
     },
 
     getList() {},
@@ -236,8 +401,13 @@ export default {
           const workbook = XLSX.read(data, { type: 'array' })
           const univerData = self.convertXlsxWorkbookToUniverData(workbook, file.name)
           self.loadUniverWorkbook(univerData)
+          self.currentDocumentId = null
+          self.currentDocumentName = univerData.name || file.name
+          self.currentDocumentType = 'imported'
           self.statusMessage = 'Excel 文件导入成功'
           self.$modal.msgSuccess('导入成功')
+          // 导入后自动保存
+          self.saveCurrentWorkbook(false)
         } catch (error) {
           console.error('XLSX 解析失败，尝试 LuckyExcel:', error)
           self.statusMessage = 'XLSX 解析失败，尝试备用方案...'
@@ -266,8 +436,13 @@ export default {
             try {
               const univerData = self.convertLuckyJsonToUniver(exportJson, file.name)
               self.loadUniverWorkbook(univerData)
+              self.currentDocumentId = null
+              self.currentDocumentName = univerData.name || file.name
+              self.currentDocumentType = 'imported'
               self.statusMessage = 'Excel 文件导入成功（备用方案）'
               self.$modal.msgSuccess('导入成功')
+              // 导入后自动保存
+              self.saveCurrentWorkbook(false)
             } catch (err) {
               console.error('LuckyExcel 数据转换失败:', err)
               self.statusMessage = '导入失败: ' + (err.message || String(err))
@@ -444,13 +619,7 @@ export default {
       }
 
       try {
-        if (this.currentWorkbookId) {
-          try {
-            this.univer.disposeUnit(this.currentWorkbookId)
-          } catch (e) {
-            console.warn('销毁旧工作簿时出错:', e)
-          }
-        }
+        this.disposeUnitById(this.currentWorkbookId)
 
         const workbook = this.univer.createUnit(UniverInstanceType.UNIVER_SHEET, workbookData)
         // 优先用 facade FWorkbook（含 setValue/merge 等方法），facade 不可用时退回核心 workbook
@@ -482,16 +651,7 @@ export default {
           return
         }
 
-        let snapshot = null
-        try {
-          snapshot = workbook.save()
-        } catch (e) {
-          console.warn('使用 save() 获取快照失败:', e)
-        }
-
-        if (!snapshot) {
-          snapshot = this.manualSnapshot()
-        }
+        const snapshot = this.getSnapshot()
 
         if (!snapshot) {
           this.$modal.msgError('获取工作簿数据失败')
@@ -704,23 +864,25 @@ export default {
       }
 
       this.loadUniverWorkbook(workbookData)
+      this.currentDocumentId = null
+      this.currentDocumentName = workbookData.name
+      this.currentDocumentType = 'created'
       this.statusMessage = '已创建新的空白工作簿'
       this.$modal.msgSuccess('创建成功')
+      // 新建后自动保存
+      this.saveCurrentWorkbook(false)
     },
 
     /** 清空当前数据 */
     clearSheet() {
       this.$modal.confirm('确认清空当前表格中的所有数据？').then(() => {
-        if (this.currentWorkbookId && this.univer) {
-          try {
-            this.univer.disposeUnit(this.currentWorkbookId)
-          } catch (e) {
-            console.warn('销毁工作簿时出错:', e)
-          }
-        }
+        this.disposeUnitById(this.currentWorkbookId)
         this.currentWorkbookId = null
         this.activeWorkbook = null
         this.hasData = false
+        this.currentDocumentId = null
+        this.currentDocumentName = ''
+        this.currentDocumentType = ''
         this.statusMessage = '数据已清空，请导入Excel文件或新建表格'
         this.$modal.msgSuccess('清空成功')
       }).catch(() => {})
@@ -753,8 +915,15 @@ export default {
 </script>
 
 <style lang="scss" scoped>
+.content-row {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+}
+
 .univer-container {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   border: 1px solid #dcdfe6;
   border-radius: 4px;
   overflow: hidden;

@@ -75,6 +75,16 @@ export async function sendChat(payload, opts = {}) {
 }
 
 /**
+ * 查询某会话的历史消息
+ * @param {string} conversationId
+ * @returns {Promise<{code,msg,data:Array}>} data 为 [{role,content,...}] 按时间升序
+ */
+export async function getHistory(conversationId) {
+  const data = await aiHttp.get('/ai/history/' + encodeURIComponent(conversationId))
+  return data
+}
+
+/**
  * 检测 AI 回复是否表明它"拒绝了"该指令（误判前端能力）
  * 触发条件：回复文本含特定关键词，且用户请求本质是表格操作
  */

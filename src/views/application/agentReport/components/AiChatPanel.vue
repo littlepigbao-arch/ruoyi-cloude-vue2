@@ -173,7 +173,7 @@
 </template>
 
 <script>
-import { sendChat } from '@/api/ai/chat'
+import { sendChat, getHistory } from '@/api/ai/chat'
 import { collectContext } from '../univer-context'
 import { executeActions } from '../univer-action-executor'
 
@@ -187,6 +187,7 @@ const QUICK_COMMANDS = [
 
 const STORAGE_POS = 'aiPanel.pos'
 const STORAGE_COLLAPSED = 'aiPanel.collapsed'
+const STORAGE_CONVERSATION = 'aiPanel.conversationId'
 
 export default {
   name: 'AiChatPanel',
@@ -209,7 +210,7 @@ export default {
       execProgress: '',
       dragging: false,
       dragStart: null,
-      lastSource: null,
+      lastSource: 'mock-fallback',
       quickCommands: QUICK_COMMANDS
     }
   },
@@ -244,10 +245,12 @@ export default {
   },
   mounted() {
     this.restoreState()
+    this.loadHistory()
   },
   beforeDestroy() {
     this.unbindDrag()
   },
+  created() {},
   methods: {
     // ============ 状态控制 ============
     collapse() {
@@ -269,6 +272,7 @@ export default {
       this.history = []
       this.conversationId = null
       this.lastSource = null
+      try { localStorage.removeItem(STORAGE_CONVERSATION) } catch (e) { /* ignore */ }
     },
 
     // ============ 拖拽 ============
@@ -329,6 +333,8 @@ export default {
           if (p && typeof p.x === 'number') this.panelPos = p
         }
         this.collapsed = localStorage.getItem(STORAGE_COLLAPSED) === '1'
+        const cid = localStorage.getItem(STORAGE_CONVERSATION)
+        if (cid) this.conversationId = cid
       } catch (e) {
         // ignore
       }
@@ -361,6 +367,7 @@ export default {
         if (resp && resp.source) this.lastSource = resp.source
         if (resp && resp.data && resp.data.conversationId) {
           this.conversationId = resp.data.conversationId
+          try { localStorage.setItem(STORAGE_CONVERSATION, this.conversationId) } catch (e) { /* ignore */ }
         }
         const actions = (resp && resp.data && resp.data.actions) || []
         const exec = executeActions(this.univerAPI, this.workbook, actions, {
@@ -393,6 +400,24 @@ export default {
       } finally {
         this.loading = false
         this.execProgress = ''
+      }
+    },
+
+    // ============ 历史记录 ============
+    async loadHistory() {
+      if (!this.conversationId) return
+      try {
+        const data = await getHistory(this.conversationId)
+        if (data && data.code === 200 && Array.isArray(data.data) && data.data.length > 0) {
+          // 只回显 role + content，不重放 actions（历史操作已执行过）
+          this.messages = data.data.map((m) => ({
+            role: m.role,
+            content: m.content || ''
+          }))
+          this.$nextTick(this.scrollToBottom)
+        }
+      } catch (e) {
+        // 后端未就绪或网络异常时静默忽略，不打扰用户
       }
     },
 
