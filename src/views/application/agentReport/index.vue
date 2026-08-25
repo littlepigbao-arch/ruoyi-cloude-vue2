@@ -75,6 +75,7 @@
         :active-id="currentDocumentId"
         @select="loadDocument"
         @delete="deleteDocument"
+        @rename="openRenameDialog"
         @refresh="fetchDocuments"
       />
       <div class="univer-container">
@@ -91,6 +92,30 @@
       :allow-mock-fallback="true"
       @executed="onAiExecuted"
     />
+
+    <!-- 重命名文档对话框 -->
+    <el-dialog
+      title="重命名文档"
+      :visible.sync="renameDialogVisible"
+      width="420px"
+      append-to-body
+    >
+      <el-form label-width="80px">
+        <el-form-item label="文档名称">
+          <el-input
+            v-model="renameName"
+            placeholder="请输入新名称"
+            maxlength="100"
+            show-word-limit
+            @keyup.enter.native="confirmRename"
+          />
+        </el-form-item>
+      </el-form>
+      <div slot="footer">
+        <el-button size="mini" @click="renameDialogVisible = false">取消</el-button>
+        <el-button type="primary" size="mini" :loading="renameLoading" @click="confirmRename">确定</el-button>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -130,7 +155,7 @@ import * as XLSX from 'xlsx'
 import { saveAs } from 'file-saver'
 import AiChatPanel from './components/AiChatPanel.vue'
 import DocumentList from './components/DocumentList.vue'
-import { listWorkbooks, getWorkbook, saveWorkbook, deleteWorkbook } from '@/api/ai/workbook'
+import { listWorkbooks, getWorkbook, saveWorkbook, deleteWorkbook, renameWorkbook } from '@/api/ai/workbook'
 
 export default {
   name: 'ApplicationExcel',
@@ -152,7 +177,12 @@ export default {
       documents: [],
       currentDocumentId: null,
       currentDocumentName: '',
-      currentDocumentType: ''
+      currentDocumentType: '',
+      // 重命名对话框状态
+      renameDialogVisible: false,
+      renameLoading: false,
+      renameTarget: null,
+      renameName: ''
     }
   },
   mounted() {
@@ -361,6 +391,59 @@ export default {
       }).catch(() => {})
     },
 
+    /** 打开重命名对话框 */
+    openRenameDialog(doc) {
+      if (!doc || !doc.workbookId) return
+      this.renameTarget = doc
+      this.renameName = doc.name || ''
+      this.renameDialogVisible = true
+    },
+
+    /** 确认重命名 */
+    confirmRename() {
+      const name = (this.renameName || '').trim()
+      if (!name) {
+        this.$modal.msgWarning('文档名称不能为空')
+        return
+      }
+      if (!this.renameTarget || !this.renameTarget.workbookId) {
+        this.renameDialogVisible = false
+        return
+      }
+      if (name === this.renameTarget.name) {
+        this.renameDialogVisible = false
+        return
+      }
+      this.renameLoading = true
+      renameWorkbook({ workbookId: this.renameTarget.workbookId, name }).then((res) => {
+        if (res && res.code === 200 && res.data) {
+          this.$modal.msgSuccess('重命名成功')
+          if (this.currentDocumentId === res.data.workbookId) {
+            this.currentDocumentName = res.data.name
+            this.statusMessage = '已重命名：' + res.data.name
+          }
+          this.renameDialogVisible = false
+          this.fetchDocuments()
+        } else {
+          this.$modal.msgError((res && res.msg) || '重命名失败')
+        }
+      }).catch((e) => {
+        console.error('重命名失败:', e)
+        this.$modal.msgError('重命名失败')
+      }).finally(() => {
+        this.renameLoading = false
+      })
+    },
+
+    /** 生成不重复的文件名（与现有列表同名则追加时间戳） */
+    uniqueName(base) {
+      let name = (base || '未命名文档').trim()
+      if (this.documents.some((d) => d.name === name)) {
+        name = name + '_' + this.formatDate(new Date())
+      }
+      return name
+    },
+
     getList() {},
 
     /** 上传前校验 */
@@ -402,7 +485,7 @@ export default {
           const univerData = self.convertXlsxWorkbookToUniverData(workbook, file.name)
           self.loadUniverWorkbook(univerData)
           self.currentDocumentId = null
-          self.currentDocumentName = univerData.name || file.name
+          self.currentDocumentName = self.uniqueName(univerData.name || file.name)
           self.currentDocumentType = 'imported'
           self.statusMessage = 'Excel 文件导入成功'
           self.$modal.msgSuccess('导入成功')
@@ -437,7 +520,7 @@ export default {
               const univerData = self.convertLuckyJsonToUniver(exportJson, file.name)
               self.loadUniverWorkbook(univerData)
               self.currentDocumentId = null
-              self.currentDocumentName = univerData.name || file.name
+              self.currentDocumentName = self.uniqueName(univerData.name || file.name)
               self.currentDocumentType = 'imported'
               self.statusMessage = 'Excel 文件导入成功（备用方案）'
               self.$modal.msgSuccess('导入成功')
@@ -834,7 +917,7 @@ export default {
     createNewSheet() {
       const workbookData = {
         id: 'workbook-' + Date.now(),
-        name: '新建工作簿',
+        name: '新建工作簿_' + this.formatDate(new Date()),
         sheetOrder: ['sheet-0'],
         sheets: {
           'sheet-0': {

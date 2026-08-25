@@ -62,3 +62,12 @@ export function saveWorkbook(payload) {
 export function deleteWorkbook(workbookId) {
   return wbHttp.delete('/ai/workbook/' + workbookId)
 }
+
+/**
+ * 重命名文档
+ * @param {object} payload {workbookId, name}
+ * @returns {Promise<{code,msg,data}>}
+ */
+export function renameWorkbook(payload) {
+  return wbHttp.put('/ai/workbook/rename', payload)
+}

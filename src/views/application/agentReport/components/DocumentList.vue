@@ -36,6 +36,15 @@
             <span class="doc-item__time">{{ formatTime(doc.updateTime || doc.createTime) }}</span>
           </div>
         </div>
+        <el-tooltip content="重命名" placement="top">
+          <el-button
+            type="text"
+            icon="el-icon-edit"
+            size="mini"
+            class="doc-item__rename"
+            @click.stop="$emit('rename', doc)"
+          />
+        </el-tooltip>
         <el-tooltip content="删除" placement="top">
           <el-button
             type="text"
@@ -139,7 +148,8 @@ export default {
   &:hover {
     background: #f5f7fa;
 
-    .doc-item__del {
+    .doc-item__del,
+    .doc-item__rename {
       opacity: 1;
     }
   }
@@ -177,6 +187,13 @@ export default {
   &__del {
     padding: 3px;
     color: #f56c6c;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+
+  &__rename {
+    padding: 3px;
+    color: #409eff;
     opacity: 0;
     transition: opacity 0.15s;
   }
