@@ -307,6 +307,28 @@ const rules = [
     name: 'getFilter',
     re: /(?:查看|读取|看一?下|查询)\s*(?:当前)?\s*筛选/,
     make: () => ({ type: 'getFilter' })
+  },
+  // —— 绘图：两个区域 + 图表类型（"A2:A5 B2:B5 画成柱状图"）——
+  {
+    name: 'chartByRange',
+    re: new RegExp('(' + RANGE + ')[\\s，,、。]*(?:和|与|跟)?[\\s，,、。]*(' + RANGE + ')[\\s，,、。]*(?:画|生成|创建|绘制|制作|做|弄)(?:成|一个|一张|个)?\\s*(柱状图|条形图|折线图|曲线图|饼图|扇形图)'),
+    make: (m) => ({
+      type: 'createChart',
+      chartType: chartTypeOf(m[3]),
+      categoryRange: up(m[1]),
+      seriesRange: up(m[2])
+    })
+  },
+  // —— 绘图：图表类型在前（"画一个柱状图 X轴A2:A5 Y轴B2:B5"）——
+  {
+    name: 'chartVerbFirst',
+    re: new RegExp('(?:画|生成|创建|绘制|制作|做|弄)\\s*(?:一个|一张|个)?\\s*(柱状图|条形图|折线图|曲线图|饼图|扇形图)[\\s，,、。]*[^A-Za-z]*(' + RANGE + ')[\\s，,、。]*[^A-Za-z]*(' + RANGE + ')'),
+    make: (m) => ({
+      type: 'createChart',
+      chartType: chartTypeOf(m[1]),
+      categoryRange: up(m[2]),
+      seriesRange: up(m[3])
+    })
   }
 ]
 
@@ -355,6 +377,7 @@ export function mockParse(message, context) {
         '• 筛选 C 列包含 张三\n' +
         '• 筛选 C 列筛选公式 =AND(C1>100, C1<200)\n' +
         '• 清除 C 列筛选 / 移除筛选 / 查看筛选\n' +
+        '• 用 A2:A5 和 B2:B5 画柱状图 / 画一个饼图 A2:A5 B2:B5\n' +
         '• 撤销 / 读取一下A1:C3',
       actions: []
     }
@@ -369,6 +392,17 @@ export function mockParse(message, context) {
 
 function up(s) {
   return String(s || '').toUpperCase()
+}
+
+/**
+ * 中文图表名 → chartType（bar/line/pie）
+ */
+function chartTypeOf(word) {
+  if (!word) return 'bar'
+  if (/柱|条形/.test(word)) return 'bar'
+  if (/折|曲线|线图/.test(word)) return 'line'
+  if (/饼|扇形/.test(word)) return 'pie'
+  return 'bar'
 }
 
 /**

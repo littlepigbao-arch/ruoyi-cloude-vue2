@@ -104,9 +104,16 @@
               <span class="exec-range" v-if="r.range">{{ r.range }}</span>
               <span class="exec-error" v-if="!r.ok">：{{ r.error }}</span>
               <span class="exec-note" v-if="r.note">（{{ r.note }}）</span>
+              <!-- 图表结果 -->
+              <div
+                v-if="r.result && r.result.chartOption"
+                class="exec-chart"
+              >
+                <chart-card :option="r.result.chartOption" height="280px" />
+              </div>
               <!-- 读取类结果表格 -->
               <table
-                v-if="r.result && r.result.values && Array.isArray(r.result.values)"
+                v-else-if="r.result && r.result.values && Array.isArray(r.result.values)"
                 class="exec-table"
               >
                 <tr v-for="(row, rri) in r.result.values.slice(0, 8)" :key="rri">
@@ -176,6 +183,7 @@
 import { sendChat, getHistory } from '@/api/ai/chat'
 import { collectContext } from '../univer-context'
 import { executeActions } from '../univer-action-executor'
+import ChartCard from './ChartCard.vue'
 
 const QUICK_COMMANDS = [
   '把A1改成100',
@@ -191,6 +199,7 @@ const STORAGE_CONVERSATION = 'aiPanel.conversationId'
 
 export default {
   name: 'AiChatPanel',
+  components: { ChartCard },
   props: {
     univerAPI: { type: Object, default: null },
     workbook: { type: Object, default: null },
@@ -666,6 +675,13 @@ function truncateHistory(history, userText, reply, actions, maxRounds) {
 .exec-result-text {
   margin-top: 4px;
   color: #409eff;
+}
+.exec-chart {
+  margin-top: 6px;
+  padding: 6px;
+  background: #fff;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
 }
 
 .ai-loading {

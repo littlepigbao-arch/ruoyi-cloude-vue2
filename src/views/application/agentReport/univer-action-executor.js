@@ -182,7 +182,8 @@ const handlers = {
   sumToCell: handleSumToCell,
   setFilter: handleSetFilter,
   clearFilter: handleClearFilter,
-  getFilter: handleGetFilter
+  getFilter: handleGetFilter,
+  createChart: handleCreateChart
 }
 
 function handleSetCell(univerAPI, sheet, action) {
@@ -286,13 +287,62 @@ function handleClearRange(univerAPI, sheet, action) {
   return note ? { note } : null
 }
 
+/**
+ * 列号（0-based）→ 列字母（A=0, Z=25, AA=26）
+ */
+function colIndexToLetter(index) {
+  let n = index
+  let letters = ''
+  do {
+    letters = String.fromCharCode(65 + (n % 26)) + letters
+    n = Math.floor(n / 26) - 1
+  } while (n >= 0)
+  return letters
+}
+
+/**
+ * 把公式里的相对 A1 引用按 (rowDelta, colDelta) 平移（$ 绝对引用不平移）。
+ * 用于把单条公式平铺到多单元格区域时保持引用相对正确。
+ * 例：shiftFormula('=CONCATENATE(B2," ",C2)', 1, 0) → '=CONCATENATE(B3," ",C3)'
+ */
+function shiftFormula(formula, rowDelta, colDelta) {
+  if (typeof formula !== 'string' || (!rowDelta && !colDelta)) return formula
+  return formula.replace(/(\$?)([A-Za-z]{1,3})(\$?)(\d+)/g, (m, colAbs, colLetters, rowAbs, rowNum) => {
+    const c =
+      colLetters
+        .toUpperCase()
+        .split('')
+        .reduce((acc, ch) => acc * 26 + (ch.charCodeAt(0) - 64), 0) - 1
+    const r = parseInt(rowNum, 10) - 1
+    const newC = colAbs ? c : c + colDelta
+    const newR = rowAbs ? r : r + rowDelta
+    if (newC < 0 || newR < 0) return m
+    return (colAbs || '') + colIndexToLetter(newC) + (rowAbs || '') + (newR + 1)
+  })
+}
+
 function handleSetFormula(univerAPI, sheet, action) {
-  const { fRange, note } = resolveRange(sheet, action.range)
+  const { fRange, range, note } = resolveRange(sheet, action.range)
   let formula = String(action.formula)
   if (!formula.startsWith('=')) formula = '=' + formula
   const r = assertSafeFormula(formula)
   if (r !== true) throw new Error(r)
-  fRange.setValue(formula)
+  const rows = range.endRow - range.startRow + 1
+  const cols = range.endColumn - range.startColumn + 1
+  if (rows === 1 && cols === 1) {
+    fRange.setValue(formula)
+  } else {
+    // 多单元格区域逐格写入相对引用公式；Univer 的 setValue 会把同一公式平铺到所有单元格，不做相对引用平移
+    const matrix = []
+    for (let ri = 0; ri < rows; ri++) {
+      const rowArr = []
+      for (let ci = 0; ci < cols; ci++) {
+        rowArr.push(shiftFormula(formula, ri, ci))
+      }
+      matrix.push(rowArr)
+    }
+    fRange.setValues(matrix)
+  }
   return note ? { note } : null
 }
 
@@ -314,7 +364,7 @@ function handleBreakApart(univerAPI, sheet, action) {
 
 function handleInsertRows(univerAPI, sheet, action) {
   const count = Math.max(1, Number(action.count) || 1)
-  const pos = Number(action.rowIndex)
+  const pos = Number(action.rowIndex) - 1 // 1-based → 0-based
   const position = action.position || 'at'
   if (position === 'after') sheet.insertRowsAfter(pos, count)
   else if (position === 'before') sheet.insertRowsBefore(pos, count)
@@ -324,14 +374,14 @@ function handleInsertRows(univerAPI, sheet, action) {
 
 function handleDeleteRows(univerAPI, sheet, action) {
   const count = Math.max(1, Number(action.count) || 1)
-  const pos = Number(action.rowPosition)
+  const pos = Number(action.rowPosition) - 1 // 1-based → 0-based
   sheet.deleteRows(pos, count)
   return null
 }
 
 function handleInsertColumns(univerAPI, sheet, action) {
   const count = Math.max(1, Number(action.count) || 1)
-  const pos = Number(action.columnIndex)
+  const pos = Number(action.columnIndex) - 1 // 1-based → 0-based
   const position = action.position || 'at'
   if (position === 'after') {
     sheet.insertColumnAfter(pos, count)
@@ -345,18 +395,18 @@ function handleInsertColumns(univerAPI, sheet, action) {
 
 function handleDeleteColumns(univerAPI, sheet, action) {
   const count = Math.max(1, Number(action.count) || 1)
-  const pos = Number(action.columnPosition)
+  const pos = Number(action.columnPosition) - 1 // 1-based → 0-based
   sheet.deleteColumns(pos, count)
   return null
 }
 
 function handleSetRowHeight(univerAPI, sheet, action) {
-  sheet.setRowHeight(Number(action.rowPosition), Number(action.height))
+  sheet.setRowHeight(Number(action.rowPosition) - 1, Number(action.height)) // 1-based → 0-based
   return null
 }
 
 function handleSetColumnWidth(univerAPI, sheet, action) {
-  sheet.setColumnWidth(Number(action.columnPosition), Number(action.width))
+  sheet.setColumnWidth(Number(action.columnPosition) - 1, Number(action.width)) // 1-based → 0-based
   return null
 }
 
@@ -690,6 +740,224 @@ function handleGetFilter(univerAPI, sheet, action) {
       filteredOutRows
     }
   }
+}
+
+// ============ 图表 handler ============
+
+const CHART_TYPE_LABELS = { bar: '柱状图', line: '折线图', pie: '饼图' }
+const AGGREGATE_LABELS = { count: '计数', sum: '求和', avg: '平均值' }
+
+/**
+ * createChart：从表格读数据，生成 ECharts option
+ * action: { chartType:'bar'|'line'|'pie', categoryRange:'A2:A5', seriesRange:'B2:B5',
+ *           seriesName?, seriesNames?, title? }
+ * 返回 { result: { chartOption, chartType, title, categoryRange, seriesRange } }
+ */
+function handleCreateChart(univerAPI, sheet, action) {
+  // 聚合统计：count(计数)/sum(求和)/avg(平均)，按 categoryRange 分组
+  const aggregate = action.aggregate
+  if (aggregate && aggregate !== 'none') {
+    return handleAggregateChart(sheet, action, aggregate)
+  }
+  const cat = resolveRange(sheet, action.categoryRange)
+  const catGrid = cat.fRange.getValues() || []
+  const categories = flattenGrid(catGrid).map(String)
+
+  const ser = resolveRange(sheet, action.seriesRange)
+  const serGrid = ser.fRange.getValues() || []
+  // 转置为 [列][行]，每列即一个系列
+  const seriesCols = transposeValues(serGrid)
+
+  const chartType = action.chartType
+  const title = action.title || ''
+
+  let option
+  if (chartType === 'pie') {
+    // 饼图仅取第一列数值
+    const data = seriesCols[0] || []
+    const pieData = categories.map((name, i) => ({ name, value: toNumber(data[i]) }))
+    option = {
+      title: { text: title, left: 'center' },
+      tooltip: { trigger: 'item' },
+      legend: { orient: 'vertical', left: 'left' },
+      series: [{ type: 'pie', radius: '60%', data: pieData }]
+    }
+  } else {
+    // bar / line：seriesRange 多列时每列一个系列
+    const series = seriesCols.map((col, i) => ({
+      name: resolveSeriesName(action, i, seriesCols.length),
+      type: chartType,
+      data: col.map(toNumber)
+    }))
+    option = {
+      title: { text: title, left: 'center' },
+      tooltip: { trigger: 'axis' },
+      grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+      xAxis: { type: 'category', data: categories },
+      yAxis: { type: 'value' },
+      series
+    }
+    if (series.length > 1) {
+      option.legend = { bottom: 0 }
+    }
+  }
+
+  return {
+    result: {
+      chartOption: option,
+      chartType,
+      title,
+      categoryRange: action.categoryRange,
+      seriesRange: action.seriesRange
+    },
+    note: '已生成' + CHART_TYPE_LABELS[chartType] + '（数据源 ' + action.categoryRange + ' / ' + action.seriesRange + '）'
+  }
+}
+
+/**
+ * 聚合图表：按 categoryRange 分组，对 seriesRange 列做 count/sum/avg 统计
+ */
+function handleAggregateChart(sheet, action, aggregate) {
+  const cat = resolveRange(sheet, action.categoryRange)
+  const catValues = flattenGrid(cat.fRange.getValues() || []).map(cellText)
+
+  let valValues = null
+  if (action.seriesRange) {
+    const ser = resolveRange(sheet, action.seriesRange)
+    valValues = flattenGrid(ser.fRange.getValues() || [])
+  }
+
+  const chartType = action.chartType
+  const title = action.title || ''
+
+  // 按分类列分组，保持首次出现顺序
+  const map = new Map()
+  const categories = []
+  for (let i = 0; i < catValues.length; i++) {
+    const key = catValues[i]
+    if (key === '') continue
+    if (!map.has(key)) {
+      map.set(key, { count: 0, sum: 0 })
+      categories.push(key)
+    }
+    const g = map.get(key)
+    g.count++
+    if (valValues) g.sum += toNumber(valValues[i])
+  }
+
+  let data
+  if (aggregate === 'count') {
+    data = categories.map((k) => map.get(k).count)
+  } else if (aggregate === 'sum') {
+    data = categories.map((k) => map.get(k).sum)
+  } else {
+    // avg
+    data = categories.map((k) => {
+      const g = map.get(k)
+      return g.count ? Math.round((g.sum / g.count) * 100) / 100 : 0
+    })
+  }
+
+  const aggLabel = AGGREGATE_LABELS[aggregate] || '统计'
+  const seriesName = action.seriesName || (aggregate === 'count' ? '数量' : aggregate === 'sum' ? '合计' : '平均值')
+
+  let option
+  if (chartType === 'pie') {
+    option = {
+      title: { text: title, left: 'center' },
+      tooltip: { trigger: 'item' },
+      legend: { orient: 'vertical', left: 'left' },
+      series: [{ name: seriesName, type: 'pie', radius: '60%', data: categories.map((name, i) => ({ name, value: data[i] })) }]
+    }
+  } else {
+    option = {
+      title: { text: title, left: 'center' },
+      tooltip: { trigger: 'axis' },
+      grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
+      xAxis: { type: 'category', data: categories },
+      yAxis: { type: 'value' },
+      series: [{ name: seriesName, type: chartType, data }]
+    }
+  }
+
+  return {
+    result: {
+      chartOption: option,
+      chartType,
+      title,
+      categoryRange: action.categoryRange,
+      seriesRange: action.seriesRange
+    },
+    note: '已生成' + CHART_TYPE_LABELS[chartType] + '（' + aggLabel + '，按 ' + action.categoryRange + ' 分组）'
+  }
+}
+
+/**
+ * 解析系列名：优先 seriesNames[i]，其次 seriesName，多系列时兜底「系列N」
+ */
+function resolveSeriesName(action, i, colCount) {
+  if (Array.isArray(action.seriesNames) && action.seriesNames[i]) return String(action.seriesNames[i])
+  if (action.seriesName) return String(action.seriesName)
+  return colCount > 1 ? '系列' + (i + 1) : '数值'
+}
+
+/**
+ * 二维 grid 展平为一维数组（逐行拼接），并解包 ICellData 对象
+ */
+function flattenGrid(grid) {
+  const out = []
+  for (const row of grid || []) {
+    for (const cell of row || []) {
+      out.push(cellValue(cell))
+    }
+  }
+  return out
+}
+
+/**
+ * 二维 grid 转置为 [列][行]
+ */
+function transposeValues(grid) {
+  const rows = (grid || []).length
+  if (rows === 0) return [[]]
+  const cols = ((grid || [])[0] || []).length
+  const out = []
+  for (let c = 0; c < cols; c++) {
+    const col = []
+    for (let r = 0; r < rows; r++) {
+      col.push(grid[r][c])
+    }
+    out.push(col)
+  }
+  return out
+}
+
+/**
+ * 解包 ICellData 对象 → 裸值
+ */
+function cellValue(v) {
+  if (v === null || v === undefined) return null
+  if (typeof v === 'object' && !Array.isArray(v)) return v.v !== undefined ? v.v : null
+  return v
+}
+
+/**
+ * 解包 ICellData → 字符串（空值返回空串），用于分组键
+ */
+function cellText(v) {
+  const raw = cellValue(v)
+  if (raw === null || raw === undefined) return ''
+  return String(raw).trim()
+}
+
+/**
+ * 转数值：非法值按 0 处理
+ */
+function toNumber(v) {
+  const raw = cellValue(v)
+  if (raw === null || raw === undefined || raw === '') return 0
+  const n = Number(raw)
+  return isNaN(n) ? 0 : n
 }
 
 // ============ 工具 ============

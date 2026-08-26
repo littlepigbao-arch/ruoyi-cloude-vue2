@@ -125,13 +125,14 @@
 
 每个 action 是一个对象，`type` 必须命中下列白名单，字段必须符合校验。**range 统一用 A1 字符串**（`"A1"`、`"B2:D5"`、`"Sheet1!A1:B2"`）。
 
-### 5.1 白名单（21 种）
+### 5.1 白名单（25 种）
 
 ```
 setCell / setCellForCell / setValues / clearRange / setFormula
 merge / breakApart / insertRows / deleteRows / insertColumns / deleteColumns
 setRowHeight / setColumnWidth / setStyle / undo / redo
 getRangeValue / getRangeFormulas / getMerges / getSelection / sumToCell
+setFilter / clearFilter / getFilter / createChart
 ```
 
 ### 5.2 各类型字段
@@ -261,6 +262,29 @@ getRangeValue / getRangeFormulas / getMerges / getSelection / sumToCell
 { "type": "getSelection" }
 ```
 这类 action 执行后结果会回显在对话气泡里，后端 `reply` 里也可自行描述。
+
+#### createChart —— 根据表格数据绘图
+```jsonc
+{
+  "type": "createChart",
+  "chartType": "bar",              // bar | line | pie
+  "categoryRange": "A2:A5",        // 分类轴（单列）
+  "seriesRange": "B2:B5",          // 数值（单列或多列）
+  "title": "各月销售额",            // 可选，图表标题
+  "seriesName": "销售额",           // 可选，单系列名
+  "seriesNames": ["销售额", "成本"] // 可选，多系列名（多列 seriesRange 时）
+}
+```
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| chartType | 是 | `bar`(柱状图)/`line`(折线图)/`pie`(饼图) |
+| categoryRange | 是 | 分类轴数据区域（A1 字符串，单列） |
+| seriesRange | 是 | 数值数据区域（A1 字符串，单列或多列；饼图只取第一列） |
+| title | 否 | 图表标题 |
+| seriesName | 否 | 单系列名称，默认「数值」 |
+| seriesNames | 否 | 多系列名称数组，与 seriesRange 列数对应 |
+
+> 前端执行后会在对话气泡中渲染一张 ECharts 图表。**关键**：模型需依据 `context.values` 推断正确的 `categoryRange` 与 `seriesRange`（通常分类列与数值列相邻，且首行为表头时从第 2 行开始）。
 
 ---
 

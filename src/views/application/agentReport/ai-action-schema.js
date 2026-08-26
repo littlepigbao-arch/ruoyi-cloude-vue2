@@ -37,8 +37,14 @@ export const ACTION_WHITELIST = [
   'sumToCell',
   'setFilter',
   'clearFilter',
-  'getFilter'
+  'getFilter',
+  'createChart'
 ]
+
+/**
+ * 图表类型白名单
+ */
+export const CHART_TYPES = ['bar', 'line', 'pie']
 
 /**
  * 筛选条件操作符（语义层 → Univer CustomFilterOperator）
@@ -471,6 +477,22 @@ export function validateAction(action) {
     }
     case 'getFilter': {
       if (action.range && !parseA1(action.range)) return 'range 解析失败: ' + action.range
+      return null
+    }
+    case 'createChart': {
+      if (!CHART_TYPES.includes(action.chartType)) {
+        return 'chartType 必须为 ' + CHART_TYPES.join('|')
+      }
+      if (action.aggregate && !['count', 'sum', 'avg'].includes(action.aggregate)) {
+        return 'aggregate 必须为 count|sum|avg'
+      }
+      if (!action.categoryRange || !parseA1(action.categoryRange)) {
+        return 'categoryRange 非法'
+      }
+      // count 统计分组次数时 seriesRange 可省略；sum/avg 必须提供数值列
+      if (action.aggregate !== 'count' && (!action.seriesRange || !parseA1(action.seriesRange))) {
+        return 'seriesRange 非法'
+      }
       return null
     }
     case 'undo':
