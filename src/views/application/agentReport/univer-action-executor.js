@@ -614,9 +614,18 @@ function handleSetFilter(univerAPI, sheet, action) {
       filters: { filters: action.filters.map(String) }
     }
   } else if (action.condition && typeof action.condition === 'object') {
-    const built = buildCustomFilters(action.condition.operator, action.condition.value)
-    if (!built) throw new Error('condition 参数非法')
-    criteria = { colId, ...built }
+    const op = action.condition.operator
+    const val = action.condition.value
+    // Univer 的 customFilter 'equal' 只做数字比较（equals.fn 里 ensureNumber 非数字直接返回 false），
+    // 文本值会被 generateCustomFilterFn 判为「非数值」而生成恒 false 的过滤函数 → 结果为空。
+    // 因此 equal 统一走 filters 精确匹配（文本/数字都能被 filterByValuesFnFactory 正确字符串化匹配）。
+    if (op === 'equal' && val !== undefined && val !== null) {
+      criteria = { colId, filters: { filters: [String(val)] } }
+    } else {
+      const built = buildCustomFilters(op, val)
+      if (!built) throw new Error('condition 参数非法')
+      criteria = { colId, ...built }
+    }
   } else if (typeof action.customFormula === 'string' && action.customFormula.trim()) {
     const built = parseFormulaToCustomFilters(action.customFormula)
     if (!built) throw new Error('customFormula 解析失败')
@@ -962,9 +971,9 @@ function toNumber(v) {
 
 // ============ 工具 ============
 
-// 探测 usedRange 时的最大扫描范围（避免大表全扫，影响性能）
-const SCAN_ROWS = 200
-const SCAN_COLS = 50
+// 探测 usedRange 时的最大扫描范围（覆盖全量数据，避免 range 判错；5000×200 足够覆盖常规表格）
+const SCAN_ROWS = 5000
+const SCAN_COLS = 200
 
 /**
  * 探测 sheet 的有效数据区域，返回 'A1:EndCell' A1 字符串
