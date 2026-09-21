@@ -40,7 +40,7 @@
 |------|------|------|------|
 | `message` | string | 是 | 用户当前输入的自然语言指令（中文） |
 | `conversationId` | string | 否 | 会话 ID，首轮可由后端生成并回传 |
-| `history` | array | 否 | 近几轮对话（role: user/assistant），用于多轮上下文 |
+| `history` | array | 否 | 旧客户端兼容字段；后端忽略，近几轮历史由数据库按 conversationId 查询 |
 | `context` | object | 否 | **当前表格状态快照**，见第三节。后端应据此理解"当前选区""B列有什么"等指代 |
 | `clientMeta` | object | 否 | 客户端元信息 |
 

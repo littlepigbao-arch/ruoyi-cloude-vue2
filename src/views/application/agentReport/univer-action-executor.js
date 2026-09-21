@@ -34,7 +34,7 @@ export function executeActions(univerAPI, workbook, actions, options = {}) {
   }
   const total = Math.min(actions.length, MAX_ACTIONS)
   for (let i = 0; i < total; i++) {
-    const action = actions[i]
+    const action = normalizeAction(actions[i])
     if (options.onProgress) {
       try {
         options.onProgress(i, total, action)
@@ -47,7 +47,7 @@ export function executeActions(univerAPI, workbook, actions, options = {}) {
     if (r.ok) ok++
     else failed++
     if (r.note) notes.push(r.note)
-    if (!r.ok && options.continueOnError === false) break
+    if (!r.ok && options.continueOnError !== true) break
   }
   if (actions.length > MAX_ACTIONS) {
     notes.push('actions 数量超过上限 ' + MAX_ACTIONS + '，已截断')
@@ -60,6 +60,7 @@ export function executeActions(univerAPI, workbook, actions, options = {}) {
  * @returns {{type,range,ok,error,result,note,durationMs}}
  */
 export function executeAction(univerAPI, workbook, action, options = {}) {
+  action = normalizeAction(action)
   const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now()
   const type = action && action.type
   const range = action && action.range
@@ -76,7 +77,7 @@ export function executeAction(univerAPI, workbook, action, options = {}) {
   // 3. 解析 sheet
   let sheet
   try {
-    sheet = resolveSheet(workbook, action.sheetName || options.sheetName)
+    sheet = resolveSheet(workbook, action.sheetId, action.sheetName || options.sheetName)
     if (!sheet) throw new Error('无法获取工作表')
   } catch (e) {
     return fail(type, range, e.message || String(e), t0)
@@ -87,6 +88,8 @@ export function executeAction(univerAPI, workbook, action, options = {}) {
     return {
       type,
       range: range || null,
+      sheetId: getSheetId(sheet),
+      sheetName: getSheetName(sheet),
       ok: true,
       error: null,
       result: (ret && ret.result) || null,
@@ -102,16 +105,64 @@ export function executeAction(univerAPI, workbook, action, options = {}) {
  * 解析 sheet：优先 sheetName，否则活动 sheet，否则第一个
  * @param {object} workbook  FWorkbook 引用（createUnit 返回值）
  */
-export function resolveSheet(workbook, sheetName) {
+export function resolveSheet(workbook, sheetId, sheetName) {
   if (!workbook) return null
+  if (sheetId) {
+    const byId = safeCall(() => workbook.getSheetBySheetId && workbook.getSheetBySheetId(sheetId))
+    if (byId) return byId
+    return null
+  }
+  if (action.schemaVersion === '2.0' && !action.sheetId && !['undo', 'redo'].includes(type)) {
+    return fail(type, range, 'Action V2 缺少 target.sheetId', t0)
+  }
   if (sheetName) {
     const byName = safeCall(() => workbook.getSheetByName && workbook.getSheetByName(sheetName))
     if (byName) return byName
+    return null
   }
   const active = safeCall(() => workbook.getActiveSheet && workbook.getActiveSheet())
   if (active) return active
   const sheets = safeCall(() => workbook.getSheets && workbook.getSheets()) || []
   return sheets[0] || null
+}
+
+/**
+ * 把 Action V2 target 转换为现有 handler 可消费的扁平结构。
+ * V1 的 Sheet!A1 写法仅作为兼容输入，执行前会真正解析出 Sheet 名称。
+ */
+export function normalizeAction(raw) {
+  if (!raw || typeof raw !== 'object') return raw
+  const action = Object.assign({}, raw)
+  const target = raw.target && typeof raw.target === 'object' ? raw.target : {}
+  action.sheetId = target.sheetId || raw.sheetId || null
+  action.sheetName = target.sheetName || raw.sheetName || null
+  action.range = target.range || raw.range || null
+  if (action.range && action.range.indexOf('!') >= 0) {
+    const split = splitSheetRange(action.range)
+    if (!action.sheetName) action.sheetName = split.sheetName
+    action.range = split.range
+  }
+  return action
+}
+
+function splitSheetRange(value) {
+  const bang = value.indexOf('!')
+  let sheetName = value.slice(0, bang).trim()
+  if ((sheetName[0] === "'" && sheetName[sheetName.length - 1] === "'") ||
+      (sheetName[0] === '"' && sheetName[sheetName.length - 1] === '"')) {
+    sheetName = sheetName.slice(1, -1)
+  }
+  return { sheetName, range: value.slice(bang + 1).trim() }
+}
+
+function getSheetId(sheet) {
+  return safeCall(() => sheet.getSheetId && sheet.getSheetId()) ||
+    safeCall(() => sheet.getId && sheet.getId()) || null
+}
+
+function getSheetName(sheet) {
+  return safeCall(() => sheet.getSheetName && sheet.getSheetName()) ||
+    safeCall(() => sheet.getName && sheet.getName()) || null
 }
 
 /**

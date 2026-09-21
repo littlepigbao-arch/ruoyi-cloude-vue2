@@ -149,8 +149,8 @@
           type="textarea"
           :rows="2"
           resize="none"
-          :placeholder="workbook ? '输入指令，Ctrl+Enter 发送' : '表格引擎尚未就绪'"
-          :disabled="!workbook || loading"
+          :placeholder="readOnly ? '历史版本为只读预览' : (workbook ? '输入指令，Ctrl+Enter 发送' : '表格引擎尚未就绪')"
+          :disabled="!workbook || loading || readOnly"
           @keydown.native.ctrl.enter="send"
           @keydown.native.meta.enter="send"
         />
@@ -162,6 +162,7 @@
               type="text"
               size="mini"
               class="ai-quick-btn"
+              :disabled="readOnly"
               @click="sendQuick(q)"
             >{{ q }}</el-button>
           </div>
@@ -170,7 +171,7 @@
             size="mini"
             icon="el-icon-s-promotion"
             :loading="loading"
-            :disabled="!workbook || !input.trim()"
+            :disabled="!workbook || !input.trim() || readOnly"
             @click="send"
           >发送</el-button>
         </div>
@@ -183,6 +184,7 @@
 import { sendChat, getHistory } from '@/api/ai/chat'
 import { collectContext } from '../univer-context'
 import { executeActions } from '../univer-action-executor'
+import { buildExecutedChanges, createOperationId } from '../change-capture'
 import ChartCard from './ChartCard.vue'
 
 const QUICK_COMMANDS = [
@@ -203,6 +205,8 @@ export default {
   props: {
     univerAPI: { type: Object, default: null },
     workbook: { type: Object, default: null },
+    workbookId: { type: [Number, String], default: null },
+    readOnly: { type: Boolean, default: false },
     visible: { type: Boolean, default: true },
     useMock: { type: Boolean, default: false },
     allowMockFallback: { type: Boolean, default: true }
@@ -212,7 +216,6 @@ export default {
       collapsed: false,
       panelPos: { x: 80, y: 120 },
       messages: [],
-      history: [],
       conversationId: null,
       input: '',
       loading: false,
@@ -224,6 +227,9 @@ export default {
     }
   },
   computed: {
+    currentUserId() {
+      return this.$store && this.$store.getters && this.$store.getters.id
+    },
     panelStyle() {
       return {
         transform: 'translate3d(' + this.panelPos.x + 'px, ' + this.panelPos.y + 'px, 0)'
@@ -250,6 +256,14 @@ export default {
     },
     loading() {
       this.$nextTick(this.scrollToBottom)
+    },
+    workbookId(newId, oldId) {
+      if (String(newId) === String(oldId)) return
+      this.switchConversationContext()
+    },
+    currentUserId(newId, oldId) {
+      if (String(newId) === String(oldId)) return
+      this.switchConversationContext()
     }
   },
   mounted() {
@@ -261,6 +275,12 @@ export default {
   },
   created() {},
   methods: {
+    switchConversationContext() {
+      this.messages = []
+      this.conversationId = null
+      this.restoreConversation()
+      this.loadHistory()
+    },
     // ============ 状态控制 ============
     collapse() {
       this.collapsed = true
@@ -278,10 +298,12 @@ export default {
     },
     clearMessages() {
       this.messages = []
-      this.history = []
       this.conversationId = null
       this.lastSource = null
-      try { localStorage.removeItem(STORAGE_CONVERSATION) } catch (e) { /* ignore */ }
+      const key = this.conversationStorageKey()
+      if (key) {
+        try { localStorage.removeItem(key) } catch (e) { /* ignore */ }
+      }
     },
 
     // ============ 拖拽 ============
@@ -342,11 +364,21 @@ export default {
           if (p && typeof p.x === 'number') this.panelPos = p
         }
         this.collapsed = localStorage.getItem(STORAGE_COLLAPSED) === '1'
-        const cid = localStorage.getItem(STORAGE_CONVERSATION)
-        if (cid) this.conversationId = cid
       } catch (e) {
         // ignore
       }
+      this.restoreConversation()
+    },
+    conversationStorageKey() {
+      const userId = this.currentUserId
+      return !userId || this.workbookId === null || this.workbookId === undefined
+        ? null
+        : STORAGE_CONVERSATION + '.' + String(userId) + '.' + String(this.workbookId)
+    },
+    restoreConversation() {
+      const key = this.conversationStorageKey()
+      if (!key) return
+      try { this.conversationId = localStorage.getItem(key) || null } catch (e) { /* ignore */ }
     },
 
     // ============ 发送 ============
@@ -356,34 +388,62 @@ export default {
     },
     async send() {
       const userText = (this.input || '').trim()
-      if (!userText || this.loading || !this.workbook) return
+      if (!userText || this.loading || !this.workbook || this.readOnly) return
+      const workbook = this.workbook
+      const workbookId = this.workbookId
       this.input = ''
       this.messages.push({ role: 'user', content: userText })
       this.loading = true
       this.execProgress = ''
       try {
-        const context = collectContext(this.workbook)
+        const context = collectContext(workbook)
+        if (context) context.workbookId = workbookId
+        const operationId = createOperationId()
+        const checkpoint = workbook.save()
         const resp = await sendChat(
           {
             message: userText,
             conversationId: this.conversationId,
-            history: this.history,
             context: context,
             clientMeta: { locale: 'zh-CN', univerVersion: '0.25.1' }
           },
           { useMock: this.useMock, allowMockFallback: this.allowMockFallback }
         )
+        // 远端响应回来前可能已切换文档，不能把旧计划应用到新工作簿。
+        if (this.workbook !== workbook || String(this.workbookId) !== String(workbookId)) return
         if (resp && resp.source) this.lastSource = resp.source
         if (resp && resp.data && resp.data.conversationId) {
           this.conversationId = resp.data.conversationId
-          try { localStorage.setItem(STORAGE_CONVERSATION, this.conversationId) } catch (e) { /* ignore */ }
+          const key = this.conversationStorageKey()
+          if (key) {
+            try { localStorage.setItem(key, this.conversationId) } catch (e) { /* ignore */ }
+          }
         }
         const actions = (resp && resp.data && resp.data.actions) || []
-        const exec = executeActions(this.univerAPI, this.workbook, actions, {
-          onProgress: (i, total) => {
-            this.execProgress = i + 1 + '/' + total
-          }
-        })
+        let exec
+        this.$emit('execution-state', true)
+        try {
+          exec = executeActions(this.univerAPI, this.workbook, actions, {
+            continueOnError: false,
+            onProgress: (i, total) => {
+              this.execProgress = i + 1 + '/' + total
+            }
+          })
+        } finally {
+          this.$emit('execution-state', false)
+        }
+        let capture = { operationId, groupId: null, changes: [] }
+        if (exec.summary.failed > 0) {
+          this.$emit('rollback', checkpoint)
+          exec.rolledBack = true
+          exec.notes.push('动作组执行失败，已恢复执行前工作簿')
+        } else {
+          const afterSnapshot = this.workbook.save()
+          capture = buildExecutedChanges(actions, exec.results, checkpoint, afterSnapshot, {
+            operationId,
+            source: 'ai'
+          })
+        }
         this.messages.push({
           role: 'assistant',
           content: (resp && resp.data && resp.data.reply) || '(无回复)',
@@ -391,15 +451,14 @@ export default {
           summary: exec.summary,
           notes: exec.notes
         })
-        // 维护多轮历史
-        this.history = truncateHistory(
-          this.history,
-          userText,
-          (resp && resp.data && resp.data.reply) || '',
-          actions,
-          6
-        )
-        this.$emit('executed', exec)
+        this.$emit('executed', Object.assign({}, exec, {
+          plannedActions: actions,
+          executedChanges: capture.changes,
+          operationId: capture.operationId,
+          groupId: capture.groupId,
+          userInstruction: userText,
+          modelReply: (resp && resp.data && resp.data.reply) || ''
+        }))
       } catch (e) {
         this.messages.push({
           role: 'assistant',
@@ -415,8 +474,10 @@ export default {
     // ============ 历史记录 ============
     async loadHistory() {
       if (!this.conversationId) return
+      const conversationId = this.conversationId
       try {
-        const data = await getHistory(this.conversationId)
+        const data = await getHistory(conversationId)
+        if (this.conversationId !== conversationId) return
         if (data && data.code === 200 && Array.isArray(data.data) && data.data.length > 0) {
           // 只回显 role + content，不重放 actions（历史操作已执行过）
           this.messages = data.data.map((m) => ({
@@ -438,15 +499,6 @@ export default {
   }
 }
 
-/**
- * 截断历史到最近 maxRounds 轮（一轮 = user + assistant）
- */
-function truncateHistory(history, userText, reply, actions, maxRounds) {
-  const next = history.slice(-maxRounds * 2)
-  next.push({ role: 'user', content: userText })
-  next.push({ role: 'assistant', content: reply, actions: actions })
-  return next.slice(-maxRounds * 2)
-}
 </script>
 
 <style lang="scss" scoped>

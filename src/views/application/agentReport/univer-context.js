@@ -8,6 +8,8 @@
  */
 
 const DEFAULT_CONFIG = {
+  // 最多向模型提供多少个 Sheet 摘要
+  maxSheets: 20,
   // values 预览上限（token 节流）；range 判定不依赖它，模型应使用 usedRange/dataRange
   maxRows: 50,
   maxCols: 26,
@@ -32,7 +34,24 @@ export function getContextConfig() {
 export function collectContext(workbook) {
   if (!workbook) return null
   const cfg = getContextConfig()
-  const sheet = safeCall(() => workbook.getActiveSheet()) || safeCall(() => (workbook.getSheets() || [])[0])
+  const allSheets = safeCall(() => workbook.getSheets && workbook.getSheets()) || []
+  const activeSheet = safeCall(() => workbook.getActiveSheet()) || allSheets[0]
+  if (!activeSheet) return null
+  const selectedSheets = allSheets.slice(0, cfg.maxSheets)
+  const sheets = selectedSheets.map(sheet => collectSheetContext(workbook, sheet, cfg)).filter(Boolean)
+  const activeSheetId = getSheetId(activeSheet)
+  const activeSheetName = getSheetName(activeSheet)
+  return {
+    workbookName: safeCall(() => workbook.getName()) || '工作簿',
+    activeSheetId,
+    activeSheetName,
+    sheets,
+    truncated: allSheets.length > selectedSheets.length
+  }
+}
+
+/** 采集单个 Sheet 的受控摘要。 */
+function collectSheetContext(workbook, sheet, cfg) {
   if (!sheet) return null
 
   // 兼容 facade（getMaxRows/getMaxColumns）与核心（getRowCount/getColumnCount）
@@ -92,9 +111,8 @@ export function collectContext(workbook) {
   }
 
   const workbookName = safeCall(() => workbook.getName()) || '工作簿'
-  const sheetName = safeCall(() => sheet.getSheetName && sheet.getSheetName()) ||
-    safeCall(() => sheet.getName && sheet.getName()) || 'Sheet1'
-  const sheetId = safeCall(() => sheet.getSheetId && sheet.getSheetId()) || null
+  const sheetName = getSheetName(sheet)
+  const sheetId = getSheetId(sheet)
 
   const ctx = {
     workbookName,
@@ -112,6 +130,16 @@ export function collectContext(workbook) {
   }
   if (hasFormula) ctx.formulas = formulas
   return ctx
+}
+
+function getSheetName(sheet) {
+  return safeCall(() => sheet.getSheetName && sheet.getSheetName()) ||
+    safeCall(() => sheet.getName && sheet.getName()) || 'Sheet1'
+}
+
+function getSheetId(sheet) {
+  return safeCall(() => sheet.getSheetId && sheet.getSheetId()) ||
+    safeCall(() => sheet.getId && sheet.getId()) || null
 }
 
 /**

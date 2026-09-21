@@ -20,6 +20,16 @@
       </el-col>
       <el-col :span="1.5">
         <el-button
+          type="primary"
+          plain
+          icon="el-icon-time"
+          size="mini"
+          @click="openVersionDialog"
+          :disabled="!currentDocumentId"
+        >版本管理</el-button>
+      </el-col>
+      <el-col :span="1.5">
+        <el-button
           type="success"
           plain
           icon="el-icon-download"
@@ -87,10 +97,14 @@
     <ai-chat-panel
       :univerAPI="univerAPI"
       :workbook="activeWorkbook"
+      :workbook-id="currentDocumentId"
+      :read-only="historyPreview"
       :visible.sync="aiPanelVisible"
       :use-mock.sync="aiUseMock"
       :allow-mock-fallback="true"
       @executed="onAiExecuted"
+      @rollback="rollbackAiOperation"
+      @execution-state="aiExecutionInProgress = $event"
     />
 
     <!-- 重命名文档对话框 -->
@@ -115,6 +129,51 @@
         <el-button size="mini" @click="renameDialogVisible = false">取消</el-button>
         <el-button type="primary" size="mini" :loading="renameLoading" @click="confirmRename">确定</el-button>
       </div>
+    </el-dialog>
+
+    <el-dialog title="版本管理" :visible.sync="versionDialogVisible" width="760px" append-to-body>
+      <el-alert
+        :title="'当前分支：' + (currentBranchName || 'main') + ' · HEAD：' + (headCommitId || '无')"
+        :description="'未提交变化：' + pendingChanges.length + ' 项'"
+        type="info" :closable="false" class="mb8"
+      />
+      <el-form inline size="mini">
+        <el-form-item label="切换分支">
+          <el-select v-model="selectedBranchId" style="width:190px" @change="checkoutSelectedBranch">
+            <el-option v-for="item in branches" :key="item.branchId" :label="item.branchName" :value="item.branchId" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="新建草稿">
+          <el-input v-model="newBranchName" style="width:180px" placeholder="例如：预算调整" />
+        </el-form-item>
+        <el-form-item>
+          <el-button @click="createDraftBranch">创建</el-button>
+        </el-form-item>
+        <el-form-item v-if="currentBranchName !== 'main'">
+          <el-button type="success" plain @click="fastForwardCurrentBranch">安全纳入 main</el-button>
+        </el-form-item>
+      </el-form>
+      <el-form inline size="mini">
+        <el-form-item label="提交说明">
+          <el-input v-model="commitMessage" style="width:360px" maxlength="500" placeholder="说明本次修改的业务目的" />
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" :disabled="!pendingChanges.length" :loading="commitLoading" @click="commitPendingChanges">提交</el-button>
+        </el-form-item>
+      </el-form>
+      <el-table :data="commitHistory" size="mini" max-height="420">
+        <el-table-column prop="commitNo" label="#" width="60" />
+        <el-table-column prop="commitMessage" label="说明" min-width="220" />
+        <el-table-column prop="source" label="来源" width="90" />
+        <el-table-column prop="authorName" label="作者" width="100" />
+        <el-table-column prop="createdTime" label="时间" width="170" />
+        <el-table-column label="操作" width="150">
+          <template slot-scope="scope">
+            <el-button type="text" size="mini" @click="previewVersion(scope.row)">预览</el-button>
+            <el-button type="text" size="mini" @click="restoreToVersion(scope.row)">恢复</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
     </el-dialog>
   </div>
 </template>
@@ -155,7 +214,12 @@ import * as XLSX from 'xlsx'
 import { saveAs } from 'file-saver'
 import AiChatPanel from './components/AiChatPanel.vue'
 import DocumentList from './components/DocumentList.vue'
-import { listWorkbooks, getWorkbook, saveWorkbook, deleteWorkbook, renameWorkbook } from '@/api/ai/workbook'
+import {
+  listWorkbooks, getWorkbook, saveWorkbook, deleteWorkbook, renameWorkbook,
+  getVersionStatus, saveWorkingState, createCommit, listCommits, getVersionSnapshot, restoreVersion,
+  listBranches, createBranch, checkoutBranch, fastForwardBranchToMain
+} from '@/api/ai/workbook'
+import { createOperationId, buildManualChanges } from './change-capture'
 
 export default {
   name: 'ApplicationExcel',
@@ -178,6 +242,27 @@ export default {
       currentDocumentId: null,
       currentDocumentName: '',
       currentDocumentType: '',
+      currentDocumentVersion: null,
+      currentBranchId: null,
+      currentBranchName: 'main',
+      selectedBranchId: null,
+      branches: [],
+      newBranchName: '',
+      branchVersion: null,
+      headCommitId: null,
+      pendingChanges: [],
+      pendingActions: [],
+      versionDialogVisible: false,
+      commitHistory: [],
+      commitMessage: '',
+      commitLoading: false,
+      aiExecutionInProgress: false,
+      changeCaptureDisposables: [],
+      manualCommands: [],
+      manualBeforeSnapshot: null,
+      manualCaptureTimer: null,
+      suspendChangeCapture: false,
+      historyPreview: false,
       // 重命名对话框状态
       renameDialogVisible: false,
       renameLoading: false,
@@ -228,6 +313,7 @@ export default {
 
         this.univer = univer
         this.univerAPI = univerAPI
+        this.registerManualChangeCapture()
         this.statusMessage = 'Univer 表格引擎初始化成功，请导入Excel文件或新建表格'
       } catch (error) {
         console.error('Univer 初始化失败:', error)
@@ -237,6 +323,7 @@ export default {
 
     /** 销毁 Univer 实例 */
     disposeUniver() {
+      this.disposeManualChangeCapture()
       if (this.univer) {
         try {
           this.univer.dispose()
@@ -269,6 +356,59 @@ export default {
       this.$nextTick(() => {
         this.initUniver()
       })
+    },
+
+    /** 监听人工顶层 Command，并在 2 秒连续输入窗口内合并为一个变更组。 */
+    registerManualChangeCapture() {
+      this.disposeManualChangeCapture()
+      if (!this.univerAPI || !this.univerAPI.Event) return
+      const before = this.univerAPI.addEvent(this.univerAPI.Event.BeforeCommandExecute, event => {
+        if (this.historyPreview && event && event.type === 0 && String(event.id || '').indexOf('sheet.') === 0) {
+          event.cancel = true
+          return
+        }
+        if (!this.shouldCaptureManualCommand(event)) return
+        if (!this.manualCommands.length) this.manualBeforeSnapshot = this.getSnapshot()
+      })
+      const after = this.univerAPI.addEvent(this.univerAPI.Event.CommandExecuted, event => {
+        if (!this.shouldCaptureManualCommand(event)) return
+        this.manualCommands.push({ id: event.id, type: event.type, params: event.params || {} })
+        clearTimeout(this.manualCaptureTimer)
+        this.manualCaptureTimer = setTimeout(() => this.flushManualChanges(), 2000)
+      })
+      this.changeCaptureDisposables = [before, after]
+    },
+
+    shouldCaptureManualCommand(event) {
+      // CommandType.COMMAND = 0；选区 OPERATION 和内部 MUTATION 不重复记录。
+      return !!event && event.type === 0 && !this.suspendChangeCapture && !this.aiExecutionInProgress &&
+        !this.historyPreview && this.hasData && !!this.currentDocumentId && String(event.id || '').indexOf('sheet.') === 0
+    },
+
+    disposeManualChangeCapture() {
+      clearTimeout(this.manualCaptureTimer)
+      this.manualCaptureTimer = null
+      ;(this.changeCaptureDisposables || []).forEach(item => {
+        try { if (item && typeof item.dispose === 'function') item.dispose() } catch (e) { /* ignore */ }
+      })
+      this.changeCaptureDisposables = []
+      this.manualCommands = []
+      this.manualBeforeSnapshot = null
+    },
+
+    flushManualChanges() {
+      if (!this.manualCommands.length || this.suspendChangeCapture || this.aiExecutionInProgress) return
+      const commands = this.manualCommands.slice()
+      const before = this.manualBeforeSnapshot
+      const after = this.getSnapshot()
+      this.manualCommands = []
+      this.manualBeforeSnapshot = null
+      this.manualCaptureTimer = null
+      const capture = buildManualChanges(commands, before, after)
+      if (!capture.changes.length) return
+      this.pendingChanges = this.pendingChanges.concat(capture.changes)
+      this.autosaveWorkingState()
+      this.statusMessage = '已记录 ' + capture.changes.length + ' 项人工修改（尚未提交）'
     },
 
     // ============ 文档持久化 ============
@@ -308,6 +448,16 @@ export default {
         if (showMsg) this.$modal.msgWarning('没有可保存的数据')
         return
       }
+      // 已纳入版本管理的工作簿，“保存”只保存分支草稿，不生成 Commit，也不覆盖 HEAD。
+      if (this.currentDocumentId) {
+        this.flushManualChanges()
+        return this.autosaveWorkingState(true).then(() => {
+          this.statusMessage = '当前分支草稿已保存（尚未提交）'
+          if (showMsg) this.$modal.msgSuccess('草稿保存成功')
+        }).catch(e => {
+          if (showMsg) this.$modal.msgError('草稿保存失败：' + (e.message || String(e)))
+        })
+      }
       const snapshot = this.getSnapshot()
       if (!snapshot) {
         if (showMsg) this.$modal.msgError('获取表格快照失败')
@@ -317,6 +467,7 @@ export default {
         workbookId: this.currentDocumentId || null,
         name: this.currentDocumentName || snapshot.name || '未命名文档',
         type: this.currentDocumentType || 'created',
+        version: this.currentDocumentVersion,
         content: JSON.stringify(snapshot)
       }
       saveWorkbook(payload).then((res) => {
@@ -324,6 +475,7 @@ export default {
           this.currentDocumentId = res.data.workbookId
           this.currentDocumentName = res.data.name
           this.currentDocumentType = res.data.type
+          this.currentDocumentVersion = res.data.version
           this.statusMessage = '已保存：' + res.data.name
           if (showMsg) this.$modal.msgSuccess('保存成功')
           this.fetchDocuments()
@@ -355,9 +507,12 @@ export default {
             return
           }
           this.loadUniverWorkbook(snapshot)
+          this.historyPreview = false
           this.currentDocumentId = wb.workbookId
           this.currentDocumentName = wb.name
           this.currentDocumentType = wb.type
+          this.currentDocumentVersion = wb.version
+          this.loadVersionStatus(true)
           this.statusMessage = '已打开：' + wb.name
         } else {
           this.$modal.msgError((res && res.msg) || '加载文档失败')
@@ -379,6 +534,8 @@ export default {
               this.currentDocumentId = null
               this.currentDocumentName = ''
               this.currentDocumentType = ''
+          this.currentDocumentVersion = null
+          this.resetVersionState()
             }
             this.fetchDocuments()
           } else {
@@ -487,6 +644,7 @@ export default {
           self.currentDocumentId = null
           self.currentDocumentName = self.uniqueName(univerData.name || file.name)
           self.currentDocumentType = 'imported'
+          self.currentDocumentVersion = null
           self.statusMessage = 'Excel 文件导入成功'
           self.$modal.msgSuccess('导入成功')
           // 导入后自动保存
@@ -522,6 +680,7 @@ export default {
               self.currentDocumentId = null
               self.currentDocumentName = self.uniqueName(univerData.name || file.name)
               self.currentDocumentType = 'imported'
+              self.currentDocumentVersion = null
               self.statusMessage = 'Excel 文件导入成功（备用方案）'
               self.$modal.msgSuccess('导入成功')
               // 导入后自动保存
@@ -702,6 +861,7 @@ export default {
       }
 
       try {
+        this.suspendChangeCapture = true
         this.disposeUnitById(this.currentWorkbookId)
 
         const workbook = this.univer.createUnit(UniverInstanceType.UNIVER_SHEET, workbookData)
@@ -716,6 +876,8 @@ export default {
       } catch (error) {
         console.error('创建 Univer 工作簿失败:', error)
         throw error
+      } finally {
+        this.$nextTick(() => { this.suspendChangeCapture = false })
       }
     },
 
@@ -950,6 +1112,8 @@ export default {
       this.currentDocumentId = null
       this.currentDocumentName = workbookData.name
       this.currentDocumentType = 'created'
+      this.currentDocumentVersion = null
+      this.resetVersionState()
       this.statusMessage = '已创建新的空白工作簿'
       this.$modal.msgSuccess('创建成功')
       // 新建后自动保存
@@ -966,6 +1130,8 @@ export default {
         this.currentDocumentId = null
         this.currentDocumentName = ''
         this.currentDocumentType = ''
+        this.currentDocumentVersion = null
+        this.resetVersionState()
         this.statusMessage = '数据已清空，请导入Excel文件或新建表格'
         this.$modal.msgSuccess('清空成功')
       }).catch(() => {})
@@ -992,6 +1158,255 @@ export default {
       if (failed > 0) msg += '，失败 ' + failed + ' 条'
       if (exec.notes && exec.notes.length) msg += '（' + exec.notes.join('；') + '）'
       this.statusMessage = msg
+      if (failed === 0 && exec.executedChanges && exec.executedChanges.length) {
+        this.pendingChanges = this.pendingChanges.concat(exec.executedChanges)
+        this.pendingActions = this.pendingActions.concat(exec.plannedActions || [])
+        this.autosaveWorkingState()
+      }
+    },
+
+    /** AI 动作组失败时恢复整本工作簿 checkpoint。 */
+    rollbackAiOperation(snapshot) {
+      if (!snapshot) return
+      try {
+        this.loadUniverWorkbook(snapshot)
+      } catch (e) {
+        console.error('恢复 AI 操作 checkpoint 失败:', e)
+        this.$modal.msgError('动作执行失败，且自动恢复工作簿失败，请重新打开文档')
+      }
+    },
+
+    resetVersionState() {
+      this.currentBranchId = null
+      this.currentBranchName = 'main'
+      this.selectedBranchId = null
+      this.branches = []
+      this.branchVersion = null
+      this.headCommitId = null
+      this.pendingChanges = []
+      this.pendingActions = []
+      this.commitHistory = []
+      this.historyPreview = false
+    },
+
+    loadVersionStatus(restoreDraft) {
+      if (!this.currentDocumentId) return Promise.resolve()
+      return getVersionStatus(this.currentDocumentId).then(res => {
+        if (res && res.code === 200 && res.data) {
+          this.currentBranchId = res.data.branchId
+          this.currentBranchName = res.data.branchName || 'main'
+          this.selectedBranchId = res.data.branchId
+          this.branchVersion = res.data.version
+          this.headCommitId = res.data.headCommitId
+          if (res.data.workbookVersion !== undefined) this.currentDocumentVersion = res.data.workbookVersion
+          const draft = res.data.workingState
+          this.pendingChanges = []
+          this.pendingActions = []
+          if (draft && draft.executedChangesJson) {
+            try { this.pendingChanges = JSON.parse(draft.executedChangesJson) || [] } catch (e) { /* ignore */ }
+          }
+          if (draft && draft.draftActionsJson) {
+            try { this.pendingActions = JSON.parse(draft.draftActionsJson) || [] } catch (e) { /* ignore */ }
+          }
+          if (restoreDraft && draft && draft.content) {
+            this.loadUniverWorkbook(JSON.parse(draft.content))
+            this.statusMessage = '已恢复分支未提交草稿：' + (res.data.branchName || 'main')
+          }
+        }
+      }).catch(e => console.warn('加载版本状态失败:', e))
+    },
+
+    autosaveWorkingState(strict) {
+      if (!this.currentDocumentId || !this.currentBranchId || !this.pendingChanges.length) return Promise.resolve()
+      const snapshot = this.getSnapshot()
+      if (!snapshot) return strict ? Promise.reject(new Error('无法获取当前工作簿快照')) : Promise.resolve()
+      return saveWorkingState(this.currentDocumentId, {
+        branchId: this.currentBranchId,
+        baseCommitId: this.headCommitId,
+        baseVersion: this.branchVersion,
+        content: JSON.stringify(snapshot),
+        plannedActions: this.pendingActions,
+        executedChanges: this.pendingChanges
+      }).then(res => {
+        if (!res || res.code !== 200) throw new Error((res && res.msg) || '保存分支草稿失败')
+        return res
+      }).catch(e => {
+        if (strict) throw e
+        console.warn('自动保存版本草稿失败:', e)
+      })
+    },
+
+    openVersionDialog() {
+      if (!this.currentDocumentId) return
+      this.versionDialogVisible = true
+      Promise.all([this.loadVersionStatus(), listCommits(this.currentDocumentId).then(res => {
+        if (res && res.code === 200) this.commitHistory = res.data || []
+      }), this.loadBranches()]).catch(e => this.$modal.msgError('加载版本信息失败：' + (e.message || String(e))))
+    },
+
+    loadBranches() {
+      if (!this.currentDocumentId) return Promise.resolve()
+      return listBranches(this.currentDocumentId).then(res => {
+        if (!res || res.code !== 200) throw new Error((res && res.msg) || '加载分支失败')
+        this.branches = res.data || []
+      })
+    },
+
+    createDraftBranch() {
+      const name = (this.newBranchName || '').trim()
+      if (!name) return this.$modal.msgWarning('请输入草稿分支名称')
+      createBranch(this.currentDocumentId, {
+        branchName: name,
+        fromCommitId: this.headCommitId,
+        operationId: createOperationId()
+      }).then(res => {
+        if (!res || res.code !== 200) throw new Error((res && res.msg) || '创建分支失败')
+        this.newBranchName = ''
+        this.$modal.msgSuccess('草稿分支已创建')
+        return this.loadBranches()
+      }).catch(e => this.$modal.msgError(e.message || String(e)))
+    },
+
+    checkoutSelectedBranch(branchId) {
+      if (!branchId || branchId === this.currentBranchId) return
+      const previousBranchId = this.currentBranchId
+      const previousSelection = previousBranchId
+      this.flushManualChanges()
+      this.autosaveWorkingState(true).then(() => checkoutBranch(this.currentDocumentId, branchId, {
+        operationId: createOperationId(),
+        currentBranchId: previousBranchId,
+        baseCommitId: this.headCommitId
+      })).then(res => {
+        if (!res || res.code !== 200 || !res.data || !res.data.content) throw new Error((res && res.msg) || '切换分支失败')
+        this.loadUniverWorkbook(JSON.parse(res.data.content))
+        this.currentBranchId = res.data.branchId
+        this.currentBranchName = res.data.branchName
+        this.selectedBranchId = res.data.branchId
+        this.branchVersion = res.data.version
+        this.headCommitId = res.data.headCommitId
+        this.currentDocumentVersion = res.data.workbookVersion
+        const draft = res.data.workingState
+        this.pendingChanges = draft && draft.executedChangesJson ? JSON.parse(draft.executedChangesJson) : []
+        this.pendingActions = draft && draft.draftActionsJson ? JSON.parse(draft.draftActionsJson) : []
+        this.statusMessage = '已切换到分支：' + res.data.branchName
+      }).catch(e => {
+        this.selectedBranchId = previousSelection
+        this.$modal.msgError('切换失败：' + (e.message || String(e)))
+      })
+    },
+
+    fastForwardCurrentBranch() {
+      this.flushManualChanges()
+      if (this.pendingChanges.length) return this.$modal.msgWarning('草稿分支还有未提交变化，请先提交')
+      const main = this.branches.find(item => item.branchName === 'main')
+      if (!main) return this.$modal.msgError('未找到 main 分支')
+      this.$confirm('仅当 main 自草稿分支创建后没有分叉时才会执行；否则系统会停止并要求人工处理冲突。是否继续？', '安全纳入 main', {
+        confirmButtonText: '继续', cancelButtonText: '取消', type: 'warning'
+      }).then(() => fastForwardBranchToMain(this.currentDocumentId, this.currentBranchId, {
+        operationId: createOperationId(),
+        mainHeadCommitId: main.headCommitId,
+        mainVersion: main.version
+      })).then(res => {
+        if (!res || res.code !== 200 || !res.data) throw new Error((res && res.msg) || '纳入 main 失败')
+        this.historyPreview = false
+        this.loadUniverWorkbook(JSON.parse(res.data.content))
+        this.currentBranchId = res.data.branchId
+        this.currentBranchName = 'main'
+        this.selectedBranchId = res.data.branchId
+        this.branchVersion = res.data.version
+        this.headCommitId = res.data.headCommitId
+        this.currentDocumentVersion = res.data.workbookVersion
+        this.$modal.msgSuccess('草稿提交已安全纳入 main')
+        return this.openVersionDialog()
+      }).catch(e => {
+        if (e !== 'cancel' && e !== 'close') this.$modal.msgError(e.message || String(e))
+      })
+    },
+
+    commitPendingChanges() {
+      this.flushManualChanges()
+      const message = (this.commitMessage || '').trim()
+      if (!message) {
+        this.$modal.msgWarning('请输入提交说明')
+        return
+      }
+      const snapshot = this.getSnapshot()
+      if (!snapshot) return
+      this.commitLoading = true
+      createCommit(this.currentDocumentId, {
+        branchId: this.currentBranchId,
+        commitMessage: message,
+        operationId: createOperationId(),
+        baseCommitId: this.headCommitId,
+        baseVersion: this.branchVersion,
+        content: JSON.stringify(snapshot),
+        source: this.pendingChanges.some(item => item.source === 'ai') && this.pendingChanges.some(item => item.source === 'manual')
+          ? 'mixed' : (this.pendingChanges.some(item => item.source === 'ai') ? 'ai' : 'manual'),
+        actionSchemaVersion: '2.0',
+        plannedActions: this.pendingActions,
+        executedChanges: this.pendingChanges,
+        diffSummary: { changeCount: this.pendingChanges.length }
+      }).then(res => {
+        if (!res || res.code !== 200) throw new Error((res && res.msg) || '提交失败')
+        this.$modal.msgSuccess('提交成功')
+        this.pendingChanges = []
+        this.pendingActions = []
+        this.commitMessage = ''
+        return this.openVersionDialog()
+      }).catch(e => this.$modal.msgError(e.message || String(e))).finally(() => {
+        this.commitLoading = false
+      })
+    },
+
+    previewVersion(row) {
+      if (!row || !row.commitId) return
+      getVersionSnapshot(this.currentDocumentId, row.commitId).then(res => {
+        if (!res || res.code !== 200 || !res.data || !res.data.content) throw new Error((res && res.msg) || '快照不存在')
+        const snapshot = JSON.parse(res.data.content)
+        this.$confirm('历史版本将以只读预览方式加载。当前未提交草稿已经自动保存，是否继续？', '版本预览', {
+          confirmButtonText: '继续', cancelButtonText: '取消', type: 'warning'
+        }).then(() => this.autosaveWorkingState(true)).then(() => {
+          this.historyPreview = true
+          this.loadUniverWorkbook(snapshot)
+          this.statusMessage = '正在预览版本 #' + row.commitNo + '（请重新打开当前文档返回编辑状态）'
+          this.versionDialogVisible = false
+        }).catch(() => {})
+      }).catch(e => this.$modal.msgError('预览失败：' + (e.message || String(e))))
+    },
+
+    restoreToVersion(row) {
+      if (!row || !row.commitId) return
+      this.flushManualChanges()
+      if (this.pendingChanges.length) {
+        this.$modal.msgWarning('当前分支还有未提交变化，请先提交后再恢复历史版本')
+        return
+      }
+      this.$confirm('恢复会把整本工作簿替换为版本 #' + row.commitNo + '，并新增一条恢复提交；原历史不会删除。是否继续？', '恢复历史版本', {
+        confirmButtonText: '确认恢复', cancelButtonText: '取消', type: 'warning'
+      }).then(() => restoreVersion(this.currentDocumentId, row.commitId, {
+        branchId: this.currentBranchId,
+        operationId: createOperationId(),
+        baseCommitId: this.headCommitId,
+        baseVersion: this.branchVersion,
+        commitMessage: '恢复到版本 #' + row.commitNo,
+        actionSchemaVersion: '2.0'
+      })).then(res => {
+        if (!res || res.code !== 200) throw new Error((res && res.msg) || '恢复失败')
+        this.$modal.msgSuccess('恢复成功，已生成新的提交')
+        this.versionDialogVisible = false
+        return getWorkbook(this.currentDocumentId)
+      }).then(res => {
+        if (res && res.code === 200 && res.data) {
+          this.historyPreview = false
+          this.loadUniverWorkbook(JSON.parse(res.data.content))
+          this.currentDocumentVersion = res.data.version
+          this.pendingChanges = []
+          this.pendingActions = []
+          this.loadVersionStatus()
+        }
+      }).catch(e => {
+        if (e !== 'cancel' && e !== 'close') this.$modal.msgError('恢复失败：' + (e.message || String(e)))
+      })
     }
   }
 }

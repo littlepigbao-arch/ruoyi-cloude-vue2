@@ -71,3 +71,43 @@ export function deleteWorkbook(workbookId) {
 export function renameWorkbook(payload) {
   return wbHttp.put('/ai/workbook/rename', payload)
 }
+
+export function getVersionStatus(workbookId) {
+  return wbHttp.get('/ai/workbook/' + workbookId + '/status')
+}
+
+export function saveWorkingState(workbookId, payload) {
+  return wbHttp.put('/ai/workbook/' + workbookId + '/working-state', payload)
+}
+
+export function createCommit(workbookId, payload) {
+  return wbHttp.post('/ai/workbook/' + workbookId + '/commits', payload)
+}
+
+export function listCommits(workbookId) {
+  return wbHttp.get('/ai/workbook/' + workbookId + '/commits')
+}
+
+export function getVersionSnapshot(workbookId, commitId) {
+  return wbHttp.get('/ai/workbook/' + workbookId + '/versions/' + commitId + '/snapshot')
+}
+
+export function restoreVersion(workbookId, commitId, payload) {
+  return wbHttp.post('/ai/workbook/' + workbookId + '/restore/' + commitId, payload)
+}
+
+export function listBranches(workbookId) {
+  return wbHttp.get('/ai/workbook/' + workbookId + '/branches')
+}
+
+export function createBranch(workbookId, payload) {
+  return wbHttp.post('/ai/workbook/' + workbookId + '/branches', payload)
+}
+
+export function checkoutBranch(workbookId, branchId, payload) {
+  return wbHttp.post('/ai/workbook/' + workbookId + '/branches/' + branchId + '/checkout', payload)
+}
+
+export function fastForwardBranchToMain(workbookId, branchId, payload) {
+  return wbHttp.post('/ai/workbook/' + workbookId + '/branches/' + branchId + '/fast-forward-to-main', payload)
+}
