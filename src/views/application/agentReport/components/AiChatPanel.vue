@@ -209,7 +209,9 @@ export default {
     readOnly: { type: Boolean, default: false },
     visible: { type: Boolean, default: true },
     useMock: { type: Boolean, default: false },
-    allowMockFallback: { type: Boolean, default: true }
+    allowMockFallback: { type: Boolean, default: true },
+    largeDataMode: { type: Boolean, default: false },
+    workbookStats: { type: Object, default: () => ({}) }
   },
   data() {
     return {
@@ -396,7 +398,10 @@ export default {
       this.loading = true
       this.execProgress = ''
       try {
-        const context = collectContext(workbook)
+        const context = collectContext(workbook, {
+          largeDataMode: this.largeDataMode,
+          sheetStats: (this.workbookStats && this.workbookStats.sheets) || {}
+        })
         if (context) context.workbookId = workbookId
         const operationId = createOperationId()
         const checkpoint = workbook.save()

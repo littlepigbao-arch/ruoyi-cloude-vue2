@@ -67,6 +67,11 @@
           :disabled="!hasData"
         >清空数据</el-button>
       </el-col>
+      <el-col v-if="largeDataMode" :span="1.5">
+        <el-tag type="warning" size="small" effect="dark">
+          大数据模式 · {{ formatLargeDataStats() }}
+        </el-tag>
+      </el-col>
       <right-toolbar :showSearch.sync="showSearch" @queryTable="getList"></right-toolbar>
     </el-row>
 
@@ -78,6 +83,22 @@
       show-icon
       class="mb8"
     />
+
+    <transition name="persist-fade">
+      <div v-if="persistBusy" class="persist-mask" @click.stop @mousedown.stop @keydown.stop>
+        <div class="persist-card">
+          <i class="el-icon-loading persist-card__icon"></i>
+          <div class="persist-card__title">{{ persistTitle }}</div>
+          <el-progress
+            :percentage="persistProgress"
+            :stroke-width="12"
+            :show-text="true"
+            status="success"
+          />
+          <div class="persist-card__hint">正在处理大数据，请勿关闭页面或刷新浏览器</div>
+        </div>
+      </div>
+    </transition>
 
     <div class="content-row">
       <document-list
@@ -98,10 +119,12 @@
       :univerAPI="univerAPI"
       :workbook="activeWorkbook"
       :workbook-id="currentDocumentId"
-      :read-only="historyPreview"
+      :read-only="historyPreview || persistBusy"
       :visible.sync="aiPanelVisible"
       :use-mock.sync="aiUseMock"
       :allow-mock-fallback="true"
+      :large-data-mode="largeDataMode"
+      :workbook-stats="workbookStats"
       @executed="onAiExecuted"
       @rollback="rollbackAiOperation"
       @execution-state="aiExecutionInProgress = $event"
@@ -219,7 +242,23 @@ import {
   getVersionStatus, saveWorkingState, createCommit, listCommits, getVersionSnapshot, restoreVersion,
   listBranches, createBranch, checkoutBranch, fastForwardBranchToMain
 } from '@/api/ai/workbook'
-import { createOperationId, buildManualChanges } from './change-capture'
+import { createOperationId, buildManualChanges, buildLightweightManualChanges } from './change-capture'
+
+const LARGE_DATA_CELL_THRESHOLD = 200000
+const LARGE_DATA_ROW_THRESHOLD = 20000
+// 大数据模式：最后一次编辑后 10 分钟自动保存
+const LARGE_DATA_AUTOSAVE_DELAY = 1000 * 60 * 1000
+// 纯导航命令不会改变工作簿数据，不能进入变更捕获和自动保存队列。
+const NON_MUTATING_SHEET_COMMANDS = new Set([
+  'sheet.command.move-selection',
+  'sheet.command.move-selection-enter-tab',
+  'sheet.command.expand-selection',
+  'sheet.command.set-scroll-relative',
+  'sheet.command.scroll-view',
+  'sheet.command.scroll-to-cell',
+  'sheet.command.scroll-view-reset',
+  'sheet.command.set-worksheet-activate'
+])
 
 export default {
   name: 'ApplicationExcel',
@@ -261,8 +300,21 @@ export default {
       manualCommands: [],
       manualBeforeSnapshot: null,
       manualCaptureTimer: null,
+      autosaveTimer: null,
+      persistBusy: false,
+      persistProgress: 0,
+      persistTitle: '正在保存表格…',
+      persistProgressTimer: null,
       suspendChangeCapture: false,
       historyPreview: false,
+      largeDataMode: false,
+      workbookStats: {
+        sheetCount: 0,
+        populatedCells: 0,
+        maxUsedRows: 0,
+        maxUsedColumns: 0,
+        sheets: {}
+      },
       // 重命名对话框状态
       renameDialogVisible: false,
       renameLoading: false,
@@ -277,6 +329,10 @@ export default {
     this.fetchDocuments()
   },
   beforeDestroy() {
+    clearTimeout(this.autosaveTimer)
+    this.autosaveTimer = null
+    clearInterval(this.persistProgressTimer)
+    this.persistProgressTimer = null
     this.disposeUniver()
   },
   methods: {
@@ -368,7 +424,7 @@ export default {
           return
         }
         if (!this.shouldCaptureManualCommand(event)) return
-        if (!this.manualCommands.length) this.manualBeforeSnapshot = this.getSnapshot()
+        if (!this.largeDataMode && !this.manualCommands.length) this.manualBeforeSnapshot = this.getSnapshot()
       })
       const after = this.univerAPI.addEvent(this.univerAPI.Event.CommandExecuted, event => {
         if (!this.shouldCaptureManualCommand(event)) return
@@ -381,8 +437,10 @@ export default {
 
     shouldCaptureManualCommand(event) {
       // CommandType.COMMAND = 0；选区 OPERATION 和内部 MUTATION 不重复记录。
-      return !!event && event.type === 0 && !this.suspendChangeCapture && !this.aiExecutionInProgress &&
-        !this.historyPreview && this.hasData && !!this.currentDocumentId && String(event.id || '').indexOf('sheet.') === 0
+      const commandId = String((event && event.id) || '')
+      return !!event && event.type === 0 && !NON_MUTATING_SHEET_COMMANDS.has(commandId) &&
+        !this.suspendChangeCapture && !this.aiExecutionInProgress && !this.historyPreview &&
+        this.hasData && !!this.currentDocumentId && commandId.indexOf('sheet.') === 0
     },
 
     disposeManualChangeCapture() {
@@ -396,19 +454,23 @@ export default {
       this.manualBeforeSnapshot = null
     },
 
-    flushManualChanges() {
+    flushManualChanges(skipAutosave) {
       if (!this.manualCommands.length || this.suspendChangeCapture || this.aiExecutionInProgress) return
       const commands = this.manualCommands.slice()
       const before = this.manualBeforeSnapshot
-      const after = this.getSnapshot()
+      const after = this.largeDataMode ? null : this.getSnapshot()
       this.manualCommands = []
       this.manualBeforeSnapshot = null
       this.manualCaptureTimer = null
-      const capture = buildManualChanges(commands, before, after)
+      const capture = this.largeDataMode
+        ? buildLightweightManualChanges(commands)
+        : buildManualChanges(commands, before, after)
       if (!capture.changes.length) return
       this.pendingChanges = this.pendingChanges.concat(capture.changes)
-      this.autosaveWorkingState()
-      this.statusMessage = '已记录 ' + capture.changes.length + ' 项人工修改（尚未提交）'
+      if (!skipAutosave) this.autosaveWorkingState()
+      this.statusMessage = this.largeDataMode
+        ? '大数据模式：已记录修改，将在停止操作 10 分钟后合并保存'
+        : '已记录 ' + capture.changes.length + ' 项人工修改（尚未提交）'
     },
 
     // ============ 文档持久化 ============
@@ -446,11 +508,12 @@ export default {
     saveCurrentWorkbook(showMsg) {
       if (!this.hasData || !this.univerAPI) {
         if (showMsg) this.$modal.msgWarning('没有可保存的数据')
-        return
+        return Promise.resolve()
       }
+      if (this.persistBusy) return Promise.resolve()
       // 已纳入版本管理的工作簿，“保存”只保存分支草稿，不生成 Commit，也不覆盖 HEAD。
       if (this.currentDocumentId) {
-        this.flushManualChanges()
+        this.flushManualChanges(true)
         return this.autosaveWorkingState(true).then(() => {
           this.statusMessage = '当前分支草稿已保存（尚未提交）'
           if (showMsg) this.$modal.msgSuccess('草稿保存成功')
@@ -458,29 +521,37 @@ export default {
           if (showMsg) this.$modal.msgError('草稿保存失败：' + (e.message || String(e)))
         })
       }
-      const snapshot = this.getSnapshot()
-      if (!snapshot) {
-        if (showMsg) this.$modal.msgError('获取表格快照失败')
-        return
-      }
-      const payload = {
-        workbookId: this.currentDocumentId || null,
-        name: this.currentDocumentName || snapshot.name || '未命名文档',
-        type: this.currentDocumentType || 'created',
-        version: this.currentDocumentVersion,
-        content: JSON.stringify(snapshot)
-      }
-      saveWorkbook(payload).then((res) => {
+      return this.runPersistTask('正在保存表格…', updateProgress => {
+        updateProgress(12, '正在生成表格快照…')
+        const snapshot = this.getSnapshot()
+        if (!snapshot) throw new Error('获取表格快照失败')
+        updateProgress(35, '正在整理大数据…')
+        const payload = {
+          workbookId: this.currentDocumentId || null,
+          name: this.currentDocumentName || snapshot.name || '未命名文档',
+          type: this.currentDocumentType || 'created',
+          version: this.currentDocumentVersion,
+          content: JSON.stringify(snapshot)
+        }
+        updateProgress(48, '正在上传表格数据…')
+        return saveWorkbook(payload, percent => {
+          updateProgress(48 + Math.round(percent * 0.42), percent >= 100 ? '正在等待服务器完成保存…' : '正在上传表格数据…')
+        }).then(res => {
+          if (!res || res.code !== 200 || !res.data) throw new Error((res && res.msg) || '保存失败')
+          return res
+        })
+      }).then((res) => {
         if (res && res.code === 200 && res.data) {
           this.currentDocumentId = res.data.workbookId
           this.currentDocumentName = res.data.name
           this.currentDocumentType = res.data.type
           this.currentDocumentVersion = res.data.version
           this.statusMessage = '已保存：' + res.data.name
+          this.loadVersionStatus(false)
           if (showMsg) this.$modal.msgSuccess('保存成功')
           this.fetchDocuments()
         } else {
-          if (showMsg) this.$modal.msgError((res && res.msg) || '保存失败')
+          throw new Error((res && res.msg) || '保存失败')
         }
       }).catch((e) => {
         console.error('保存文档失败:', e)
@@ -488,38 +559,120 @@ export default {
       })
     },
 
+    /** 在浏览器完成一次绘制后再执行同步快照，确保进度层先显示。 */
+    nextUiFrame() {
+      return new Promise(resolve => {
+        this.$nextTick(() => setTimeout(resolve, 50))
+      })
+    },
+
+    updatePersistProgress(percentage, title) {
+      this.persistProgress = Math.max(this.persistProgress, Math.min(99, Number(percentage) || 0))
+      if (title) this.persistTitle = title
+    },
+
+    runPersistTask(title, executor) {
+      if (this.persistBusy) return Promise.reject(new Error('已有保存或提交任务正在进行'))
+      clearTimeout(this.autosaveTimer)
+      this.autosaveTimer = null
+      this.persistBusy = true
+      this.persistProgress = 3
+      this.persistTitle = title
+      clearInterval(this.persistProgressTimer)
+      this.persistProgressTimer = setInterval(() => {
+        if (this.persistProgress < 88) this.persistProgress += this.persistProgress < 45 ? 2 : 1
+      }, 900)
+      const update = (percentage, nextTitle) => this.updatePersistProgress(percentage, nextTitle)
+      return this.nextUiFrame()
+        .then(() => executor(update))
+        .then(result => {
+          this.persistProgress = 100
+          this.persistTitle = title.indexOf('提交') >= 0
+            ? '提交完成'
+            : (title.indexOf('打开') >= 0 || title.indexOf('切换') >= 0 ? '文件打开完成' : '保存完成')
+          return result
+        })
+        .catch(error => {
+          this.persistTitle = title.indexOf('提交') >= 0
+            ? '提交失败'
+            : (title.indexOf('打开') >= 0 || title.indexOf('切换') >= 0 ? '文件打开失败' : '保存失败')
+          throw error
+        })
+        .finally(() => {
+          clearInterval(this.persistProgressTimer)
+          this.persistProgressTimer = null
+          setTimeout(() => {
+            this.persistBusy = false
+            this.persistProgress = 0
+          }, 350)
+        })
+    },
+
     /** 打开文档 */
     loadDocument(doc) {
-      if (!doc || !doc.workbookId) return
-      getWorkbook(doc.workbookId).then((res) => {
-        if (res && res.code === 200 && res.data) {
-          const wb = res.data
-          if (!wb.content) {
-            this.$modal.msgWarning('文档内容为空')
-            return
+      if (!doc || !doc.workbookId || this.persistBusy) return
+      if (String(doc.workbookId) === String(this.currentDocumentId) && !this.historyPreview) return
+      const targetWorkbookId = doc.workbookId
+      this.runPersistTask('正在切换文件…', updateProgress => {
+        // 切换前先收口当前编辑，避免大数据模式尚未触发的延迟保存丢失。
+        this.flushManualChanges(true)
+        let saveCurrent = Promise.resolve()
+        if (this.currentDocumentId && this.currentBranchId && this.pendingChanges.length) {
+          const previousWorkbookId = this.currentDocumentId
+          updateProgress(8, '正在保存当前文件的修改…')
+          const snapshot = this.getSnapshot()
+          if (!snapshot) throw new Error('无法保存当前文件的修改')
+          const payload = {
+            branchId: this.currentBranchId,
+            baseCommitId: this.headCommitId,
+            baseVersion: this.branchVersion,
+            content: JSON.stringify(snapshot),
+            plannedActions: this.pendingActions,
+            executedChanges: this.pendingChanges
           }
-          let snapshot = null
-          try {
-            snapshot = JSON.parse(wb.content)
-          } catch (e) {
-            console.error('文档内容解析失败:', e)
-            this.$modal.msgError('文档内容解析失败')
-            return
+          saveCurrent = saveWorkingState(previousWorkbookId, payload, percent => {
+            updateProgress(8 + Math.round(percent * 0.2), '正在保存当前文件的修改…')
+          }).then(res => {
+            if (!res || res.code !== 200) throw new Error((res && res.msg) || '当前文件保存失败')
+          })
+        }
+        return saveCurrent.then(() => {
+          updateProgress(32, '正在下载目标文件…')
+          // 文档内容和版本状态并行获取，避免串行等待。
+          return Promise.all([
+            getWorkbook(targetWorkbookId),
+            getVersionStatus(targetWorkbookId).catch(() => null)
+          ])
+        }).then(results => {
+          const workbookRes = results[0]
+          const statusRes = results[1]
+          if (!workbookRes || workbookRes.code !== 200 || !workbookRes.data) {
+            throw new Error((workbookRes && workbookRes.msg) || '加载文档失败')
           }
-          this.loadUniverWorkbook(snapshot)
-          this.historyPreview = false
+          const wb = workbookRes.data
+          const status = statusRes && statusRes.code === 200 ? statusRes.data : null
+          const draft = status && status.workingState
+          const content = draft && draft.content ? draft.content : wb.content
+          if (!content) throw new Error('文档内容为空')
+          updateProgress(55, draft && draft.content ? '正在解析未提交草稿…' : '正在解析文件数据…')
+          const snapshot = JSON.parse(content)
+          updateProgress(68, '正在构建大数据表格…')
           this.currentDocumentId = wb.workbookId
           this.currentDocumentName = wb.name
           this.currentDocumentType = wb.type
           this.currentDocumentVersion = wb.version
-          this.loadVersionStatus(true)
-          this.statusMessage = '已打开：' + wb.name
-        } else {
-          this.$modal.msgError((res && res.msg) || '加载文档失败')
-        }
+          this.applyVersionStatus(status)
+          this.loadUniverWorkbook(snapshot)
+          this.historyPreview = false
+          updateProgress(94, '正在完成文件切换…')
+          this.statusMessage = draft && draft.content
+            ? '已打开并恢复未提交草稿：' + wb.name
+            : '已打开：' + wb.name
+          return wb
+        })
       }).catch((e) => {
         console.error('加载文档失败:', e)
-        this.$modal.msgError('加载文档失败')
+        this.$modal.msgError('加载文档失败：' + (e.message || String(e)))
       })
     },
 
@@ -645,10 +798,12 @@ export default {
           self.currentDocumentName = self.uniqueName(univerData.name || file.name)
           self.currentDocumentType = 'imported'
           self.currentDocumentVersion = null
+          self.resetVersionState()
           self.statusMessage = 'Excel 文件导入成功'
           self.$modal.msgSuccess('导入成功')
-          // 导入后自动保存
-          self.saveCurrentWorkbook(false)
+          // 大表先保证界面可操作，由用户确认后再做首次完整保存。
+          if (!self.largeDataMode) self.saveCurrentWorkbook(false)
+          else self.statusMessage = 'Excel 导入成功，已自动启用大数据模式；请点击“保存”完成首次保存'
         } catch (error) {
           console.error('XLSX 解析失败，尝试 LuckyExcel:', error)
           self.statusMessage = 'XLSX 解析失败，尝试备用方案...'
@@ -681,10 +836,11 @@ export default {
               self.currentDocumentName = self.uniqueName(univerData.name || file.name)
               self.currentDocumentType = 'imported'
               self.currentDocumentVersion = null
+              self.resetVersionState()
               self.statusMessage = 'Excel 文件导入成功（备用方案）'
               self.$modal.msgSuccess('导入成功')
-              // 导入后自动保存
-              self.saveCurrentWorkbook(false)
+              if (!self.largeDataMode) self.saveCurrentWorkbook(false)
+              else self.statusMessage = 'Excel 导入成功，已自动启用大数据模式；请点击“保存”完成首次保存'
             } catch (err) {
               console.error('LuckyExcel 数据转换失败:', err)
               self.statusMessage = '导入失败: ' + (err.message || String(err))
@@ -796,27 +952,25 @@ export default {
         let maxRow = 0
         let maxCol = 0
 
-        if (ws['!ref']) {
-          const range = XLSX.utils.decode_range(ws['!ref'])
-          for (let r = range.s.r; r <= range.e.r; r++) {
-            for (let c = range.s.c; c <= range.e.c; c++) {
-              const cellAddr = XLSX.utils.encode_cell({ r: r, c: c })
-              const cell = ws[cellAddr]
-              if (cell) {
-                if (!cellData[r]) cellData[r] = {}
-                let t = 2
-                if (cell.t === 'n' || cell.t === 'b' || cell.t === 'd') t = 1
-                cellData[r][c] = {
-                  v: cell.v !== undefined ? cell.v : (cell.w || ''),
-                  t: t,
-                  f: cell.f || undefined
-                }
-                if (r > maxRow) maxRow = r
-                if (c > maxCol) maxCol = c
-              }
-            }
+        // 只遍历真实存在的单元格，避免对大范围稀疏表逐格探测空白区域。
+        Object.keys(ws).forEach(cellAddr => {
+          if (cellAddr.charAt(0) === '!' || !/^[A-Z]+[1-9]\d*$/i.test(cellAddr)) return
+          const cell = ws[cellAddr]
+          if (!cell) return
+          const pos = XLSX.utils.decode_cell(cellAddr)
+          const r = pos.r
+          const c = pos.c
+          if (!cellData[r]) cellData[r] = {}
+          let t = 2
+          if (cell.t === 'n' || cell.t === 'b' || cell.t === 'd') t = 1
+          cellData[r][c] = {
+            v: cell.v !== undefined ? cell.v : (cell.w || ''),
+            t: t,
+            f: cell.f || undefined
           }
-        }
+          if (r > maxRow) maxRow = r
+          if (c > maxCol) maxCol = c
+        })
 
         const mergeData = []
         if (ws['!merges'] && ws['!merges'].length > 0) {
@@ -862,6 +1016,7 @@ export default {
 
       try {
         this.suspendChangeCapture = true
+        this.applyDataMode(workbookData)
         this.disposeUnitById(this.currentWorkbookId)
 
         const workbook = this.univer.createUnit(UniverInstanceType.UNIVER_SHEET, workbookData)
@@ -879,6 +1034,50 @@ export default {
       } finally {
         this.$nextTick(() => { this.suspendChangeCapture = false })
       }
+    },
+
+    /** 根据实际有值的单元格自动切换大数据模式。 */
+    applyDataMode(workbookData) {
+      const stats = {
+        sheetCount: 0,
+        populatedCells: 0,
+        maxUsedRows: 0,
+        maxUsedColumns: 0,
+        sheets: {}
+      }
+      const sheets = (workbookData && workbookData.sheets) || {}
+      const ids = (workbookData && workbookData.sheetOrder) || Object.keys(sheets)
+      ids.forEach(sheetId => {
+        const sheet = sheets[sheetId] || {}
+        const cellData = sheet.cellData || {}
+        let populatedCells = 0
+        let maxUsedRows = 0
+        let maxUsedColumns = 0
+        Object.keys(cellData).forEach(rowKey => {
+          const row = cellData[rowKey] || {}
+          const columns = Object.keys(row)
+          if (!columns.length) return
+          populatedCells += columns.length
+          maxUsedRows = Math.max(maxUsedRows, Number(rowKey) + 1)
+          columns.forEach(columnKey => {
+            maxUsedColumns = Math.max(maxUsedColumns, Number(columnKey) + 1)
+          })
+        })
+        stats.sheetCount += 1
+        stats.populatedCells += populatedCells
+        stats.maxUsedRows = Math.max(stats.maxUsedRows, maxUsedRows)
+        stats.maxUsedColumns = Math.max(stats.maxUsedColumns, maxUsedColumns)
+        stats.sheets[sheetId] = { populatedCells, maxUsedRows, maxUsedColumns }
+      })
+      this.workbookStats = stats
+      this.largeDataMode = stats.populatedCells >= LARGE_DATA_CELL_THRESHOLD ||
+        stats.maxUsedRows >= LARGE_DATA_ROW_THRESHOLD
+    },
+
+    formatLargeDataStats() {
+      const stats = this.workbookStats || {}
+      return Number(stats.maxUsedRows || 0).toLocaleString() + ' 行 / ' +
+        Number(stats.populatedCells || 0).toLocaleString() + ' 单元格'
     },
 
     /** 导出 Excel */
@@ -1023,8 +1222,8 @@ export default {
         maxRow = Math.max(maxRow, actualMaxRow + 1)
       }
 
-      const limitRow = Math.min(maxRow, 10000)
-      const limitCol = Math.min(maxCol, 1000)
+      const limitRow = Math.min(maxRow, 100000)
+      const limitCol = Math.min(maxCol, 100)
 
       for (let r = 0; r < limitRow; r++) {
         const row = []
@@ -1132,6 +1331,8 @@ export default {
         this.currentDocumentType = ''
         this.currentDocumentVersion = null
         this.resetVersionState()
+        this.largeDataMode = false
+        this.workbookStats = { sheetCount: 0, populatedCells: 0, maxUsedRows: 0, maxUsedColumns: 0, sheets: {} }
         this.statusMessage = '数据已清空，请导入Excel文件或新建表格'
         this.$modal.msgSuccess('清空成功')
       }).catch(() => {})
@@ -1189,25 +1390,35 @@ export default {
       this.historyPreview = false
     },
 
+    /** 只应用版本元数据；工作簿内容由调用方决定何时加载。 */
+    applyVersionStatus(data) {
+      if (!data) {
+        this.resetVersionState()
+        return null
+      }
+      this.currentBranchId = data.branchId
+      this.currentBranchName = data.branchName || 'main'
+      this.selectedBranchId = data.branchId
+      this.branchVersion = data.version
+      this.headCommitId = data.headCommitId
+      if (data.workbookVersion !== undefined) this.currentDocumentVersion = data.workbookVersion
+      const draft = data.workingState
+      this.pendingChanges = []
+      this.pendingActions = []
+      if (draft && draft.executedChangesJson) {
+        try { this.pendingChanges = JSON.parse(draft.executedChangesJson) || [] } catch (e) { /* ignore */ }
+      }
+      if (draft && draft.draftActionsJson) {
+        try { this.pendingActions = JSON.parse(draft.draftActionsJson) || [] } catch (e) { /* ignore */ }
+      }
+      return draft
+    },
+
     loadVersionStatus(restoreDraft) {
       if (!this.currentDocumentId) return Promise.resolve()
       return getVersionStatus(this.currentDocumentId).then(res => {
         if (res && res.code === 200 && res.data) {
-          this.currentBranchId = res.data.branchId
-          this.currentBranchName = res.data.branchName || 'main'
-          this.selectedBranchId = res.data.branchId
-          this.branchVersion = res.data.version
-          this.headCommitId = res.data.headCommitId
-          if (res.data.workbookVersion !== undefined) this.currentDocumentVersion = res.data.workbookVersion
-          const draft = res.data.workingState
-          this.pendingChanges = []
-          this.pendingActions = []
-          if (draft && draft.executedChangesJson) {
-            try { this.pendingChanges = JSON.parse(draft.executedChangesJson) || [] } catch (e) { /* ignore */ }
-          }
-          if (draft && draft.draftActionsJson) {
-            try { this.pendingActions = JSON.parse(draft.draftActionsJson) || [] } catch (e) { /* ignore */ }
-          }
+          const draft = this.applyVersionStatus(res.data)
           if (restoreDraft && draft && draft.content) {
             this.loadUniverWorkbook(JSON.parse(draft.content))
             this.statusMessage = '已恢复分支未提交草稿：' + (res.data.branchName || 'main')
@@ -1218,15 +1429,42 @@ export default {
 
     autosaveWorkingState(strict) {
       if (!this.currentDocumentId || !this.currentBranchId || !this.pendingChanges.length) return Promise.resolve()
-      const snapshot = this.getSnapshot()
-      if (!snapshot) return strict ? Promise.reject(new Error('无法获取当前工作簿快照')) : Promise.resolve()
-      return saveWorkingState(this.currentDocumentId, {
-        branchId: this.currentBranchId,
-        baseCommitId: this.headCommitId,
-        baseVersion: this.branchVersion,
-        content: JSON.stringify(snapshot),
-        plannedActions: this.pendingActions,
-        executedChanges: this.pendingChanges
+      if (this.largeDataMode && !strict) {
+        clearTimeout(this.autosaveTimer)
+        this.autosaveTimer = setTimeout(() => {
+          this.autosaveTimer = null
+          this.performAutosaveWorkingState(false)
+        }, LARGE_DATA_AUTOSAVE_DELAY)
+        return Promise.resolve()
+      }
+      clearTimeout(this.autosaveTimer)
+      this.autosaveTimer = null
+      return this.performAutosaveWorkingState(strict)
+    },
+
+    performAutosaveWorkingState(strict) {
+      if (!this.currentDocumentId || !this.currentBranchId || !this.pendingChanges.length) return Promise.resolve()
+      if (this.persistBusy) return strict ? Promise.reject(new Error('已有保存或提交任务正在进行')) : Promise.resolve()
+      return this.runPersistTask(strict ? '正在保存草稿…' : '正在自动保存大数据表格…', updateProgress => {
+        updateProgress(12, '正在生成表格快照…')
+        const snapshot = this.getSnapshot()
+        if (!snapshot) throw new Error('无法获取当前工作簿快照')
+        updateProgress(35, '正在整理草稿数据…')
+        const payload = {
+          branchId: this.currentBranchId,
+          baseCommitId: this.headCommitId,
+          baseVersion: this.branchVersion,
+          content: JSON.stringify(snapshot),
+          plannedActions: this.pendingActions,
+          executedChanges: this.pendingChanges
+        }
+        updateProgress(48, '正在上传草稿数据…')
+        return saveWorkingState(this.currentDocumentId, payload, percent => {
+          updateProgress(48 + Math.round(percent * 0.42), percent >= 100 ? '正在等待服务器保存草稿…' : '正在上传草稿数据…')
+        }).then(res => {
+          if (!res || res.code !== 200) throw new Error((res && res.msg) || '保存分支草稿失败')
+          return res
+        })
       }).then(res => {
         if (!res || res.code !== 200) throw new Error((res && res.msg) || '保存分支草稿失败')
         return res
@@ -1271,7 +1509,7 @@ export default {
       if (!branchId || branchId === this.currentBranchId) return
       const previousBranchId = this.currentBranchId
       const previousSelection = previousBranchId
-      this.flushManualChanges()
+      this.flushManualChanges(true)
       this.autosaveWorkingState(true).then(() => checkoutBranch(this.currentDocumentId, branchId, {
         operationId: createOperationId(),
         currentBranchId: previousBranchId,
@@ -1324,28 +1562,40 @@ export default {
     },
 
     commitPendingChanges() {
-      this.flushManualChanges()
+      if (this.persistBusy) return
+      this.flushManualChanges(true)
       const message = (this.commitMessage || '').trim()
       if (!message) {
         this.$modal.msgWarning('请输入提交说明')
         return
       }
-      const snapshot = this.getSnapshot()
-      if (!snapshot) return
       this.commitLoading = true
-      createCommit(this.currentDocumentId, {
-        branchId: this.currentBranchId,
-        commitMessage: message,
-        operationId: createOperationId(),
-        baseCommitId: this.headCommitId,
-        baseVersion: this.branchVersion,
-        content: JSON.stringify(snapshot),
-        source: this.pendingChanges.some(item => item.source === 'ai') && this.pendingChanges.some(item => item.source === 'manual')
-          ? 'mixed' : (this.pendingChanges.some(item => item.source === 'ai') ? 'ai' : 'manual'),
-        actionSchemaVersion: '2.0',
-        plannedActions: this.pendingActions,
-        executedChanges: this.pendingChanges,
-        diffSummary: { changeCount: this.pendingChanges.length }
+      this.runPersistTask('正在提交版本…', updateProgress => {
+        updateProgress(12, '正在生成提交快照…')
+        const snapshot = this.getSnapshot()
+        if (!snapshot) throw new Error('无法获取当前工作簿快照')
+        updateProgress(35, '正在整理版本数据…')
+        const payload = {
+          branchId: this.currentBranchId,
+          commitMessage: message,
+          operationId: createOperationId(),
+          baseCommitId: this.headCommitId,
+          baseVersion: this.branchVersion,
+          content: JSON.stringify(snapshot),
+          source: this.pendingChanges.some(item => item.source === 'ai') && this.pendingChanges.some(item => item.source === 'manual')
+            ? 'mixed' : (this.pendingChanges.some(item => item.source === 'ai') ? 'ai' : 'manual'),
+          actionSchemaVersion: '2.0',
+          plannedActions: this.pendingActions,
+          executedChanges: this.pendingChanges,
+          diffSummary: { changeCount: this.pendingChanges.length }
+        }
+        updateProgress(48, '正在上传并创建版本…')
+        return createCommit(this.currentDocumentId, payload, percent => {
+          updateProgress(48 + Math.round(percent * 0.42), percent >= 100 ? '正在等待服务器创建版本…' : '正在上传并创建版本…')
+        }).then(res => {
+          if (!res || res.code !== 200) throw new Error((res && res.msg) || '提交失败')
+          return res
+        })
       }).then(res => {
         if (!res || res.code !== 200) throw new Error((res && res.msg) || '提交失败')
         this.$modal.msgSuccess('提交成功')
@@ -1432,6 +1682,57 @@ export default {
   width: 100%;
   height: calc(100vh - 320px);
   min-height: 500px;
+}
+
+.persist-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 4000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(16, 24, 40, 0.46);
+  backdrop-filter: blur(2px);
+  cursor: wait;
+}
+
+.persist-card {
+  width: 420px;
+  max-width: calc(100vw - 48px);
+  padding: 30px 34px 26px;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.22);
+  text-align: center;
+}
+
+.persist-card__icon {
+  margin-bottom: 12px;
+  color: #409eff;
+  font-size: 34px;
+}
+
+.persist-card__title {
+  margin-bottom: 20px;
+  color: #303133;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.persist-card__hint {
+  margin-top: 14px;
+  color: #909399;
+  font-size: 12px;
+}
+
+.persist-fade-enter-active,
+.persist-fade-leave-active {
+  transition: opacity 0.18s ease;
+}
+
+.persist-fade-enter,
+.persist-fade-leave-to {
+  opacity: 0;
 }
 
 .mb8 {

@@ -31,14 +31,14 @@ export function getContextConfig() {
  * @param {object} univerAPI
  * @returns {object|null} context 对象；无活动工作簿/sheet 时返回 null
  */
-export function collectContext(workbook) {
+export function collectContext(workbook, options = {}) {
   if (!workbook) return null
   const cfg = getContextConfig()
   const allSheets = safeCall(() => workbook.getSheets && workbook.getSheets()) || []
   const activeSheet = safeCall(() => workbook.getActiveSheet()) || allSheets[0]
   if (!activeSheet) return null
   const selectedSheets = allSheets.slice(0, cfg.maxSheets)
-  const sheets = selectedSheets.map(sheet => collectSheetContext(workbook, sheet, cfg)).filter(Boolean)
+  const sheets = selectedSheets.map(sheet => collectSheetContext(workbook, sheet, cfg, options)).filter(Boolean)
   const activeSheetId = getSheetId(activeSheet)
   const activeSheetName = getSheetName(activeSheet)
   return {
@@ -51,7 +51,7 @@ export function collectContext(workbook) {
 }
 
 /** 采集单个 Sheet 的受控摘要。 */
-function collectSheetContext(workbook, sheet, cfg) {
+function collectSheetContext(workbook, sheet, cfg, options) {
   if (!sheet) return null
 
   // 兼容 facade（getMaxRows/getMaxColumns）与核心（getRowCount/getColumnCount）
@@ -59,7 +59,15 @@ function collectSheetContext(workbook, sheet, cfg) {
   const columnCount = safeCall(() => sheet.getMaxColumns && sheet.getMaxColumns()) || safeCall(() => sheet.getColumnCount && sheet.getColumnCount()) || 0
 
   // 1. 探测 usedRange（最后一个非空单元格的行列）
-  const { endRow, endColumn } = detectUsedRange(sheet, rowCount, columnCount, cfg)
+  const sheetId = getSheetId(sheet)
+  const knownStats = options && options.sheetStats && options.sheetStats[sheetId]
+  const detected = knownStats && options.largeDataMode
+    ? {
+        endRow: Math.max(0, Number(knownStats.maxUsedRows || 1) - 1),
+        endColumn: Math.max(0, Number(knownStats.maxUsedColumns || 1) - 1)
+      }
+    : detectUsedRange(sheet, rowCount, columnCount, cfg)
+  const { endRow, endColumn } = detected
 
   // 2. 截断到 maxRows × maxCols，逐格取 value/formula
   const capRows = Math.min(endRow + 1, cfg.maxRows)
@@ -112,8 +120,6 @@ function collectSheetContext(workbook, sheet, cfg) {
 
   const workbookName = safeCall(() => workbook.getName()) || '工作簿'
   const sheetName = getSheetName(sheet)
-  const sheetId = getSheetId(sheet)
-
   const ctx = {
     workbookName,
     sheetName,

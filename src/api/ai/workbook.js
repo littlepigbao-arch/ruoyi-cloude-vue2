@@ -50,8 +50,8 @@ export function getWorkbook(workbookId) {
  * @param {object} payload {workbookId?, name, type, content}
  * @returns {Promise<{code,msg,data}>}
  */
-export function saveWorkbook(payload) {
-  return wbHttp.post('/ai/workbook/save', payload)
+export function saveWorkbook(payload, onUploadProgress) {
+  return wbHttp.post('/ai/workbook/save', payload, uploadConfig(onUploadProgress))
 }
 
 /**
@@ -76,12 +76,22 @@ export function getVersionStatus(workbookId) {
   return wbHttp.get('/ai/workbook/' + workbookId + '/status')
 }
 
-export function saveWorkingState(workbookId, payload) {
-  return wbHttp.put('/ai/workbook/' + workbookId + '/working-state', payload)
+export function saveWorkingState(workbookId, payload, onUploadProgress) {
+  return wbHttp.put('/ai/workbook/' + workbookId + '/working-state', payload, uploadConfig(onUploadProgress))
 }
 
-export function createCommit(workbookId, payload) {
-  return wbHttp.post('/ai/workbook/' + workbookId + '/commits', payload)
+export function createCommit(workbookId, payload, onUploadProgress) {
+  return wbHttp.post('/ai/workbook/' + workbookId + '/commits', payload, uploadConfig(onUploadProgress))
+}
+
+function uploadConfig(callback) {
+  if (typeof callback !== 'function') return undefined
+  return {
+    onUploadProgress(event) {
+      if (!event || !event.total) return
+      callback(Math.min(100, Math.round(event.loaded * 100 / event.total)))
+    }
+  }
 }
 
 export function listCommits(workbookId) {
