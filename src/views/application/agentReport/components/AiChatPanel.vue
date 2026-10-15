@@ -12,7 +12,7 @@
     </div>
 
     <!-- 展开态：完整面板 -->
-    <div v-else class="ai-panel" :style="panelStyle">
+    <div v-show="!collapsed" class="ai-panel" :style="panelStyle">
       <!-- 标题栏（可拖拽） -->
       <div class="ai-panel__header" @mousedown="onHeaderMouseDown">
         <span class="ai-panel__title">
@@ -59,6 +59,8 @@
 
       <!-- 消息列表 -->
       <div ref="body" class="ai-panel__body">
+        <agent-task-panel ref="agent" :workbook-id="workbookId" :workspace="agentWorkspace"
+          @mode="agentMode = $event" @busy="agentBusy = $event" />
         <div v-if="messages.length === 0" class="ai-empty">
           <i class="el-icon-chat-line-square"></i>
           <p>输入中文指令操纵表格，例如：</p>
@@ -150,7 +152,7 @@
           :rows="2"
           resize="none"
           :placeholder="readOnly ? '历史版本为只读预览' : (workbook ? '输入指令，Ctrl+Enter 发送' : '表格引擎尚未就绪')"
-          :disabled="!workbook || loading || readOnly"
+          :disabled="!workbook || loading || readOnly || agentLocked"
           @keydown.native.ctrl.enter="send"
           @keydown.native.meta.enter="send"
         />
@@ -171,7 +173,7 @@
             size="mini"
             icon="el-icon-s-promotion"
             :loading="loading"
-            :disabled="!workbook || !input.trim() || readOnly"
+            :disabled="!workbook || !input.trim() || readOnly || agentLocked"
             @click="send"
           >发送</el-button>
         </div>
@@ -186,6 +188,7 @@ import { collectContext } from '../univer-context'
 import { executeActions } from '../univer-action-executor'
 import { buildExecutedChanges, createOperationId } from '../change-capture'
 import ChartCard from './ChartCard.vue'
+import AgentTaskPanel from './AgentTaskPanel.vue'
 
 const QUICK_COMMANDS = [
   '把A1改成100',
@@ -201,11 +204,13 @@ const STORAGE_CONVERSATION = 'aiPanel.conversationId'
 
 export default {
   name: 'AiChatPanel',
-  components: { ChartCard },
+  components: { ChartCard, AgentTaskPanel },
   props: {
     univerAPI: { type: Object, default: null },
     workbook: { type: Object, default: null },
     workbookId: { type: [Number, String], default: null },
+    agentWorkspace: { type: Object, required: true },
+    agentLocked: { type: Boolean, default: false },
     readOnly: { type: Boolean, default: false },
     visible: { type: Boolean, default: true },
     useMock: { type: Boolean, default: false },
@@ -216,6 +221,8 @@ export default {
   data() {
     return {
       collapsed: false,
+      agentMode: false,
+      agentBusy: false,
       panelPos: { x: 80, y: 120 },
       messages: [],
       conversationId: null,
@@ -299,6 +306,7 @@ export default {
       this.$emit('update:useMock', v)
     },
     clearMessages() {
+      if (this.agentLocked) return this.$message.warning('请先停止或完成当前任务，再开始新会话')
       this.messages = []
       this.conversationId = null
       this.lastSource = null
@@ -390,7 +398,16 @@ export default {
     },
     async send() {
       const userText = (this.input || '').trim()
-      if (!userText || this.loading || !this.workbook || this.readOnly) return
+      if (!userText || this.loading || !this.workbook || this.readOnly || this.agentLocked) return
+      if (this.agentMode) {
+        this.input = ''
+        this.messages.push({ role: 'user', content: userText })
+        this.loading = true
+        try { await this.$refs.agent.start(userText, this.conversationId) }
+        catch (e) { this.messages.push({ role: 'assistant', content: e.message, error: true }) }
+        finally { this.loading = false }
+        return
+      }
       const workbook = this.workbook
       const workbookId = this.workbookId
       this.input = ''

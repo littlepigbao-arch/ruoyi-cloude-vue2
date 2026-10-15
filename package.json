@@ -5,6 +5,7 @@
   "author": "Coco",
   "license": "MIT",
   "scripts": {
+    "test:agent:a1": "node tests/agentReport/a1-regression.cjs",
     "dev": "vue-cli-service serve",
     "build:prod": "vue-cli-service build",
     "build:stage": "vue-cli-service build --mode staging",

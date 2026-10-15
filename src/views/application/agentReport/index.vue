@@ -1,5 +1,7 @@
 <template>
   <div class="app-container">
+    <el-alert v-if="conflictDrafts.length" title="已保留同步前的本地编辑草稿，可下载后进行人工合并" type="warning" :closable="false" />
+    <el-button v-if="conflictDrafts.length" size="mini" @click="downloadConflictDrafts">下载保留的编辑草稿</el-button>
     <el-row :gutter="10" class="mb8">
       <el-col :span="1.5">
         <el-upload
@@ -119,6 +121,8 @@
       :univerAPI="univerAPI"
       :workbook="activeWorkbook"
       :workbook-id="currentDocumentId"
+      :agent-workspace="agentWorkspaceAdapter"
+      :agent-locked="agentLocked"
       :read-only="historyPreview || persistBusy"
       :visible.sync="aiPanelVisible"
       :use-mock.sync="aiUseMock"
@@ -237,12 +241,14 @@ import * as XLSX from 'xlsx'
 import { saveAs } from 'file-saver'
 import AiChatPanel from './components/AiChatPanel.vue'
 import DocumentList from './components/DocumentList.vue'
+import { agentWorkspace } from '@/api/ai/agent'
 import {
   listWorkbooks, getWorkbook, saveWorkbook, deleteWorkbook, renameWorkbook,
   getVersionStatus, saveWorkingState, createCommit, listCommits, getVersionSnapshot, restoreVersion,
   listBranches, createBranch, checkoutBranch, fastForwardBranchToMain
 } from '@/api/ai/workbook'
 import { createOperationId, buildManualChanges, buildLightweightManualChanges } from './change-capture'
+import { workingStatePayload, sameWorkspace } from './working-state-sync'
 
 const LARGE_DATA_CELL_THRESHOLD = 200000
 const LARGE_DATA_ROW_THRESHOLD = 20000
@@ -288,6 +294,14 @@ export default {
       branches: [],
       newBranchName: '',
       branchVersion: null,
+      draftVersion: -1,
+      loadedRevision: null,
+      loadedSnapshotFingerprint: null,
+      workspaceGeneration: 0,
+      agentSyncRequired: false,
+      conflictDrafts: [],
+      agentLocked: false,
+      agentApplying: false,
       headCommitId: null,
       pendingChanges: [],
       pendingActions: [],
@@ -322,7 +336,19 @@ export default {
       renameName: ''
     }
   },
+  computed: {
+    agentWorkspaceAdapter() {
+      return { lock: this.lockAgentWorkspace, prepare: this.prepareAgentWorkspace, apply: this.applyAgentSnapshot,
+        saved: this.refreshAgentDraft, reload: this.reloadAgentDraft }
+    }
+  },
   mounted() {
+    try {
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i)
+        if (key && key.startsWith('agentReport:conflict:')) this.conflictDrafts.push(JSON.parse(sessionStorage.getItem(key)))
+      }
+    } catch (e) { this.statusMessage = '保留草稿读取失败，请勿关闭已有编辑页面' }
     this.$nextTick(() => {
       this.initUniver()
     })
@@ -336,6 +362,89 @@ export default {
     this.disposeUniver()
   },
   methods: {
+    lockAgentWorkspace(value) {
+      if (!value && this.agentSyncRequired) return
+      this.agentLocked = value
+      if (value) { clearTimeout(this.autosaveTimer); this.autosaveTimer = null }
+    },
+    async prepareAgentWorkspace() {
+      if (!this.currentDocumentId || !this.currentBranchId || this.historyPreview || this.persistBusy) throw new Error('请先保存并打开可编辑的工作簿')
+      this.flushManualChanges(true)
+      const snapshot = this.getSnapshot()
+      if (!snapshot) throw new Error('无法获取当前工作簿')
+      const identity = this.workspaceIdentity()
+      const response = await saveWorkingState(this.currentDocumentId, workingStatePayload(this, snapshot))
+      if (!response || response.code !== 200) throw new Error((response && response.msg) || '运行前草稿保存失败')
+      if (!sameWorkspace(this, identity)) throw new Error('工作簿已切换，忽略旧保存响应')
+      this.adoptSavedDraft(response.data, snapshot)
+      return agentWorkspace(this.currentDocumentId)
+    },
+    async applyAgentSnapshot(snapshot) {
+      if (!this.agentLocked) throw new Error('工作区未锁定，拒绝执行')
+      if (!this.univer || !this.univerAPI) throw new Error('表格引擎尚未就绪，保持保护状态')
+      const checkpoint = this.getSnapshot()
+      this.agentApplying = true
+      this.aiExecutionInProgress = true
+      try {
+        // A bounded proposal is produced by the server's registered tools; never execute model code.
+        this.loadUniverWorkbook(JSON.parse(JSON.stringify(snapshot)))
+        await this.$nextTick()
+        const hasFormulas = Object.values(snapshot.sheets || {}).some(sheet => Object.values(sheet.cellData || {}).some(row => Object.values(row).some(cell => cell && cell.f)))
+        if (hasFormulas) {
+          const engine = this.univerAPI.getFormula && this.univerAPI.getFormula()
+          if (!engine || typeof engine.onCalculationResultApplied !== 'function') throw new Error('当前表格引擎不能确认公式计算完成，任务已暂停')
+          await engine.onCalculationResultApplied(15000)
+        }
+        const actual = this.getSnapshot()
+        if (!actual) throw new Error('执行后无法回读工作簿')
+        return actual
+      } catch (e) {
+        if (checkpoint) this.loadUniverWorkbook(checkpoint)
+        throw e
+      } finally { this.agentApplying = false; this.aiExecutionInProgress = false }
+    },
+    async refreshAgentDraft() {
+      return this.reloadAgentDraft()
+    },
+    async reloadAgentDraft() {
+      const identity = this.workspaceIdentity()
+      this.agentSyncRequired = true
+      this.lockAgentWorkspace(true)
+      const state = await agentWorkspace(this.currentDocumentId)
+      if (!sameWorkspace(this, identity) || String(state.workbookId) !== String(identity.workbookId) || String(state.branchId) !== String(identity.branchId)) throw new Error('工作簿或分支已变化，忽略旧同步响应')
+      if (!state.loadedRevision || !Number.isInteger(state.draftVersion) || !state.snapshot) throw new Error('服务器同步版本信息不完整')
+      this.preserveLocalDraft()
+      await this.applyAgentSnapshot(state.snapshot)
+      if (!sameWorkspace(this, identity)) throw new Error('工作簿已变化，保持保护状态')
+      this.applyVersionStatus({ branchId: state.branchId, branchName: state.branchName, version: state.branchVersion,
+        headCommitId: state.headCommitId, workbookVersion: state.workbookVersion, workingState: state.workingState }, true)
+      this.draftVersion = state.draftVersion
+      this.loadedRevision = state.loadedRevision
+      this.loadedSnapshotFingerprint = JSON.stringify(this.getSnapshot())
+      this.agentSyncRequired = false
+      return state
+    },
+    workspaceIdentity() {
+      return { workbookId: this.currentDocumentId, branchId: this.currentBranchId, generation: this.workspaceGeneration }
+    },
+    adoptSavedDraft(draft, snapshot) {
+      this.draftVersion = draft.version
+      this.loadedRevision = draft.loadedRevision || draft.contentHash
+      this.loadedSnapshotFingerprint = JSON.stringify(snapshot)
+    },
+    preserveLocalDraft() {
+      this.flushManualChanges(true)
+      const snapshot = this.getSnapshot()
+      if (!snapshot || JSON.stringify(snapshot) === this.loadedSnapshotFingerprint) return
+      const draft = { workbookId: this.currentDocumentId, branchId: this.currentBranchId, loadedRevision: this.loadedRevision,
+        expectedDraftVersion: this.draftVersion, snapshot, plannedActions: this.pendingActions, executedChanges: this.pendingChanges, savedAt: Date.now() }
+      this.conflictDrafts.push(draft)
+      try { sessionStorage.setItem('agentReport:conflict:' + draft.workbookId + ':' + draft.savedAt, JSON.stringify(draft)) }
+      catch (e) { throw new Error('本地编辑保留空间不足，已保持原内容和保护状态；请下载保留草稿') }
+    },
+    downloadConflictDrafts() {
+      saveAs(new Blob([JSON.stringify(this.conflictDrafts)], { type: 'application/json;charset=utf-8' }), '保留的编辑草稿.json')
+    },
     /** 初始化 Univer 表格引擎 */
     initUniver() {
       try {
@@ -419,7 +528,7 @@ export default {
       this.disposeManualChangeCapture()
       if (!this.univerAPI || !this.univerAPI.Event) return
       const before = this.univerAPI.addEvent(this.univerAPI.Event.BeforeCommandExecute, event => {
-        if (this.historyPreview && event && event.type === 0 && String(event.id || '').indexOf('sheet.') === 0) {
+        if ((this.historyPreview || (this.agentLocked && !this.agentApplying)) && event && event.type === 0 && String(event.id || '').indexOf('sheet.') === 0) {
           event.cancel = true
           return
         }
@@ -439,7 +548,7 @@ export default {
       // CommandType.COMMAND = 0；选区 OPERATION 和内部 MUTATION 不重复记录。
       const commandId = String((event && event.id) || '')
       return !!event && event.type === 0 && !NON_MUTATING_SHEET_COMMANDS.has(commandId) &&
-        !this.suspendChangeCapture && !this.aiExecutionInProgress && !this.historyPreview &&
+        !this.suspendChangeCapture && !this.aiExecutionInProgress && !this.historyPreview && !this.agentLocked &&
         this.hasData && !!this.currentDocumentId && commandId.indexOf('sheet.') === 0
     },
 
@@ -506,6 +615,7 @@ export default {
 
     /** 保存当前表格到后端（showMsg 控制是否弹成功/失败提示） */
     saveCurrentWorkbook(showMsg) {
+      if (this.agentLocked) return Promise.reject(new Error('请先停止或完成智能体任务'))
       if (!this.hasData || !this.univerAPI) {
         if (showMsg) this.$modal.msgWarning('没有可保存的数据')
         return Promise.resolve()
@@ -610,9 +720,11 @@ export default {
 
     /** 打开文档 */
     loadDocument(doc) {
+      if (this.agentLocked) return this.$modal.msgWarning('任务运行或待核实期间不能切换工作簿')
       if (!doc || !doc.workbookId || this.persistBusy) return
       if (String(doc.workbookId) === String(this.currentDocumentId) && !this.historyPreview) return
       const targetWorkbookId = doc.workbookId
+      const loadGeneration = ++this.workspaceGeneration
       this.runPersistTask('正在切换文件…', updateProgress => {
         // 切换前先收口当前编辑，避免大数据模式尚未触发的延迟保存丢失。
         this.flushManualChanges(true)
@@ -622,18 +734,14 @@ export default {
           updateProgress(8, '正在保存当前文件的修改…')
           const snapshot = this.getSnapshot()
           if (!snapshot) throw new Error('无法保存当前文件的修改')
-          const payload = {
-            branchId: this.currentBranchId,
-            baseCommitId: this.headCommitId,
-            baseVersion: this.branchVersion,
-            content: JSON.stringify(snapshot),
-            plannedActions: this.pendingActions,
-            executedChanges: this.pendingChanges
-          }
+          const identity = this.workspaceIdentity()
+          const payload = workingStatePayload(this, snapshot)
           saveCurrent = saveWorkingState(previousWorkbookId, payload, percent => {
             updateProgress(8 + Math.round(percent * 0.2), '正在保存当前文件的修改…')
           }).then(res => {
             if (!res || res.code !== 200) throw new Error((res && res.msg) || '当前文件保存失败')
+            if (!sameWorkspace(this, identity)) throw new Error('工作簿已变化，忽略旧保存响应')
+            this.adoptSavedDraft(res.data, snapshot)
           })
         }
         return saveCurrent.then(() => {
@@ -644,6 +752,7 @@ export default {
             getVersionStatus(targetWorkbookId).catch(() => null)
           ])
         }).then(results => {
+          if (loadGeneration !== this.workspaceGeneration) throw new Error('文件加载已过期，忽略旧响应')
           const workbookRes = results[0]
           const statusRes = results[1]
           if (!workbookRes || workbookRes.code !== 200 || !workbookRes.data) {
@@ -651,18 +760,21 @@ export default {
           }
           const wb = workbookRes.data
           const status = statusRes && statusRes.code === 200 ? statusRes.data : null
+          if (!status || !status.loadedRevision || !status.content) throw new Error('无法获取一致的文件内容与版本，请稍后重试')
           const draft = status && status.workingState
-          const content = draft && draft.content ? draft.content : wb.content
+          const content = status.content
           if (!content) throw new Error('文档内容为空')
           updateProgress(55, draft && draft.content ? '正在解析未提交草稿…' : '正在解析文件数据…')
           const snapshot = JSON.parse(content)
           updateProgress(68, '正在构建大数据表格…')
+          this.preserveLocalDraft()
           this.currentDocumentId = wb.workbookId
           this.currentDocumentName = wb.name
           this.currentDocumentType = wb.type
           this.currentDocumentVersion = wb.version
-          this.applyVersionStatus(status)
           this.loadUniverWorkbook(snapshot)
+          this.applyVersionStatus(status, true)
+          this.loadedSnapshotFingerprint = JSON.stringify(this.getSnapshot())
           this.historyPreview = false
           updateProgress(94, '正在完成文件切换…')
           this.statusMessage = draft && draft.content
@@ -758,6 +870,7 @@ export default {
 
     /** 上传前校验 */
     beforeUpload(file) {
+      if (this.agentLocked) { this.$modal.msgWarning('请先停止或完成智能体任务'); return false }
       const isExcel =
         file.name.endsWith('.xlsx') ||
         file.name.endsWith('.xls') ||
@@ -1276,6 +1389,7 @@ export default {
 
     /** 创建新的空白表格 */
     createNewSheet() {
+      if (this.agentLocked) return this.$modal.msgWarning('请先停止或完成智能体任务')
       const workbookData = {
         id: 'workbook-' + Date.now(),
         name: '新建工作簿_' + this.formatDate(new Date()),
@@ -1321,6 +1435,7 @@ export default {
 
     /** 清空当前数据 */
     clearSheet() {
+      if (this.agentLocked) return this.$modal.msgWarning('请先停止或完成智能体任务')
       this.$modal.confirm('确认清空当前表格中的所有数据？').then(() => {
         this.disposeUnitById(this.currentWorkbookId)
         this.currentWorkbookId = null
@@ -1378,6 +1493,10 @@ export default {
     },
 
     resetVersionState() {
+      this.workspaceGeneration++
+      this.loadedRevision = null
+      this.loadedSnapshotFingerprint = null
+      this.draftVersion = -1
       this.currentBranchId = null
       this.currentBranchName = 'main'
       this.selectedBranchId = null
@@ -1391,11 +1510,12 @@ export default {
     },
 
     /** 只应用版本元数据；工作簿内容由调用方决定何时加载。 */
-    applyVersionStatus(data) {
+    applyVersionStatus(data, contentLoaded = false) {
       if (!data) {
         this.resetVersionState()
         return null
       }
+      if (!contentLoaded && this.loadedRevision) return data.workingState
       this.currentBranchId = data.branchId
       this.currentBranchName = data.branchName || 'main'
       this.selectedBranchId = data.branchId
@@ -1403,6 +1523,9 @@ export default {
       this.headCommitId = data.headCommitId
       if (data.workbookVersion !== undefined) this.currentDocumentVersion = data.workbookVersion
       const draft = data.workingState
+      // Metadata dialogs must not bless stale local content with a newer token.
+      this.draftVersion = draft ? draft.version : -1
+      this.loadedRevision = data.loadedRevision || (draft && draft.contentHash) || data.contentHash
       this.pendingChanges = []
       this.pendingActions = []
       if (draft && draft.executedChangesJson) {
@@ -1416,12 +1539,17 @@ export default {
 
     loadVersionStatus(restoreDraft) {
       if (!this.currentDocumentId) return Promise.resolve()
+      const identity = this.workspaceIdentity()
       return getVersionStatus(this.currentDocumentId).then(res => {
+        if (!sameWorkspace(this, identity)) return
         if (res && res.code === 200 && res.data) {
-          const draft = this.applyVersionStatus(res.data)
-          if (restoreDraft && draft && draft.content) {
-            this.loadUniverWorkbook(JSON.parse(draft.content))
-            this.statusMessage = '已恢复分支未提交草稿：' + (res.data.branchName || 'main')
+          // Only initial save or an actual reload can adopt fresh draft tokens.
+          if (restoreDraft || !this.loadedRevision) {
+            if (!res.data.content || !res.data.loadedRevision) throw new Error('服务器内容与版本不完整，不能更新页面版本')
+            this.preserveLocalDraft()
+            this.loadUniverWorkbook(JSON.parse(res.data.content))
+            this.applyVersionStatus(res.data, true)
+            this.loadedSnapshotFingerprint = JSON.stringify(this.getSnapshot())
           }
         }
       }).catch(e => console.warn('加载版本状态失败:', e))
@@ -1443,6 +1571,7 @@ export default {
     },
 
     performAutosaveWorkingState(strict) {
+      if (this.agentLocked || this.agentSyncRequired) return strict ? Promise.reject(new Error('工作区待核实，编辑已保留')) : Promise.resolve()
       if (!this.currentDocumentId || !this.currentBranchId || !this.pendingChanges.length) return Promise.resolve()
       if (this.persistBusy) return strict ? Promise.reject(new Error('已有保存或提交任务正在进行')) : Promise.resolve()
       return this.runPersistTask(strict ? '正在保存草稿…' : '正在自动保存大数据表格…', updateProgress => {
@@ -1450,19 +1579,15 @@ export default {
         const snapshot = this.getSnapshot()
         if (!snapshot) throw new Error('无法获取当前工作簿快照')
         updateProgress(35, '正在整理草稿数据…')
-        const payload = {
-          branchId: this.currentBranchId,
-          baseCommitId: this.headCommitId,
-          baseVersion: this.branchVersion,
-          content: JSON.stringify(snapshot),
-          plannedActions: this.pendingActions,
-          executedChanges: this.pendingChanges
-        }
+        const identity = this.workspaceIdentity()
+        const payload = workingStatePayload(this, snapshot)
         updateProgress(48, '正在上传草稿数据…')
         return saveWorkingState(this.currentDocumentId, payload, percent => {
           updateProgress(48 + Math.round(percent * 0.42), percent >= 100 ? '正在等待服务器保存草稿…' : '正在上传草稿数据…')
         }).then(res => {
           if (!res || res.code !== 200) throw new Error((res && res.msg) || '保存分支草稿失败')
+          if (!sameWorkspace(this, identity)) throw new Error('工作簿已变化，忽略旧保存响应')
+          this.adoptSavedDraft(res.data, snapshot)
           return res
         })
       }).then(res => {
@@ -1475,6 +1600,7 @@ export default {
     },
 
     openVersionDialog() {
+      if (this.agentLocked) return this.$modal.msgWarning('请先停止或完成智能体任务')
       if (!this.currentDocumentId) return
       this.versionDialogVisible = true
       Promise.all([this.loadVersionStatus(), listCommits(this.currentDocumentId).then(res => {
@@ -1506,16 +1632,20 @@ export default {
     },
 
     checkoutSelectedBranch(branchId) {
+      if (this.agentLocked) { this.selectedBranchId = this.currentBranchId; return this.$modal.msgWarning('任务期间不能切换分支') }
       if (!branchId || branchId === this.currentBranchId) return
       const previousBranchId = this.currentBranchId
       const previousSelection = previousBranchId
+      const identity = this.workspaceIdentity()
       this.flushManualChanges(true)
       this.autosaveWorkingState(true).then(() => checkoutBranch(this.currentDocumentId, branchId, {
         operationId: createOperationId(),
         currentBranchId: previousBranchId,
         baseCommitId: this.headCommitId
       })).then(res => {
+        if (!sameWorkspace(this, identity)) throw new Error('分支切换响应已过期')
         if (!res || res.code !== 200 || !res.data || !res.data.content) throw new Error((res && res.msg) || '切换分支失败')
+        this.preserveLocalDraft()
         this.loadUniverWorkbook(JSON.parse(res.data.content))
         this.currentBranchId = res.data.branchId
         this.currentBranchName = res.data.branchName
@@ -1524,6 +1654,10 @@ export default {
         this.headCommitId = res.data.headCommitId
         this.currentDocumentVersion = res.data.workbookVersion
         const draft = res.data.workingState
+        this.draftVersion = draft ? draft.version : -1
+        this.loadedRevision = res.data.contentHash
+        this.loadedSnapshotFingerprint = JSON.stringify(this.getSnapshot())
+        this.workspaceGeneration++
         this.pendingChanges = draft && draft.executedChangesJson ? JSON.parse(draft.executedChangesJson) : []
         this.pendingActions = draft && draft.draftActionsJson ? JSON.parse(draft.draftActionsJson) : []
         this.statusMessage = '已切换到分支：' + res.data.branchName
@@ -1555,6 +1689,11 @@ export default {
         this.headCommitId = res.data.headCommitId
         this.currentDocumentVersion = res.data.workbookVersion
         this.$modal.msgSuccess('草稿提交已安全纳入 main')
+        this.draftVersion = -1
+        this.loadedRevision = res.data.contentHash
+        this.loadedSnapshotFingerprint = JSON.stringify(this.getSnapshot())
+        this.pendingChanges = []; this.pendingActions = []
+        this.workspaceGeneration++
         return this.openVersionDialog()
       }).catch(e => {
         if (e !== 'cancel' && e !== 'close') this.$modal.msgError(e.message || String(e))
@@ -1562,6 +1701,7 @@ export default {
     },
 
     commitPendingChanges() {
+      if (this.agentLocked) return this.$modal.msgWarning('请先停止或完成智能体任务')
       if (this.persistBusy) return
       this.flushManualChanges(true)
       const message = (this.commitMessage || '').trim()
@@ -1575,6 +1715,9 @@ export default {
         const snapshot = this.getSnapshot()
         if (!snapshot) throw new Error('无法获取当前工作簿快照')
         updateProgress(35, '正在整理版本数据…')
+        const identity = this.workspaceIdentity()
+        const submittedChanges = this.pendingChanges.length
+        const submittedActions = this.pendingActions.length
         const payload = {
           branchId: this.currentBranchId,
           commitMessage: message,
@@ -1594,13 +1737,18 @@ export default {
           updateProgress(48 + Math.round(percent * 0.42), percent >= 100 ? '正在等待服务器创建版本…' : '正在上传并创建版本…')
         }).then(res => {
           if (!res || res.code !== 200) throw new Error((res && res.msg) || '提交失败')
+          if (!sameWorkspace(this, identity)) throw new Error('提交响应已过期')
+          this.headCommitId = res.data.commitId
+          this.branchVersion = res.data.branchVersion === undefined ? payload.baseVersion + 1 : res.data.branchVersion
+          this.currentDocumentVersion = res.data.workbookVersion === undefined ? this.currentDocumentVersion + 1 : res.data.workbookVersion
+          this.adoptSavedDraft({ version: -1, loadedRevision: res.data.afterHash }, snapshot)
+          this.pendingChanges = this.pendingChanges.slice(submittedChanges)
+          this.pendingActions = this.pendingActions.slice(submittedActions)
           return res
         })
       }).then(res => {
         if (!res || res.code !== 200) throw new Error((res && res.msg) || '提交失败')
         this.$modal.msgSuccess('提交成功')
-        this.pendingChanges = []
-        this.pendingActions = []
         this.commitMessage = ''
         return this.openVersionDialog()
       }).catch(e => this.$modal.msgError(e.message || String(e))).finally(() => {
@@ -1610,12 +1758,16 @@ export default {
 
     previewVersion(row) {
       if (!row || !row.commitId) return
+      const identity = this.workspaceIdentity()
       getVersionSnapshot(this.currentDocumentId, row.commitId).then(res => {
+        if (!sameWorkspace(this, identity)) throw new Error('历史预览响应已过期')
         if (!res || res.code !== 200 || !res.data || !res.data.content) throw new Error((res && res.msg) || '快照不存在')
         const snapshot = JSON.parse(res.data.content)
         this.$confirm('历史版本将以只读预览方式加载。当前未提交草稿已经自动保存，是否继续？', '版本预览', {
           confirmButtonText: '继续', cancelButtonText: '取消', type: 'warning'
         }).then(() => this.autosaveWorkingState(true)).then(() => {
+          if (!sameWorkspace(this, identity)) throw new Error('工作簿已切换，取消历史预览')
+          this.preserveLocalDraft()
           this.historyPreview = true
           this.loadUniverWorkbook(snapshot)
           this.statusMessage = '正在预览版本 #' + row.commitNo + '（请重新打开当前文档返回编辑状态）'
@@ -1625,7 +1777,9 @@ export default {
     },
 
     restoreToVersion(row) {
+      if (this.agentLocked) return this.$modal.msgWarning('工作区待核实，请先结束当前任务')
       if (!row || !row.commitId) return
+      const identity = this.workspaceIdentity()
       this.flushManualChanges()
       if (this.pendingChanges.length) {
         this.$modal.msgWarning('当前分支还有未提交变化，请先提交后再恢复历史版本')
@@ -1633,26 +1787,30 @@ export default {
       }
       this.$confirm('恢复会把整本工作簿替换为版本 #' + row.commitNo + '，并新增一条恢复提交；原历史不会删除。是否继续？', '恢复历史版本', {
         confirmButtonText: '确认恢复', cancelButtonText: '取消', type: 'warning'
-      }).then(() => restoreVersion(this.currentDocumentId, row.commitId, {
-        branchId: this.currentBranchId,
-        operationId: createOperationId(),
-        baseCommitId: this.headCommitId,
-        baseVersion: this.branchVersion,
-        commitMessage: '恢复到版本 #' + row.commitNo,
-        actionSchemaVersion: '2.0'
-      })).then(res => {
+      }).then(() => {
+        if (!sameWorkspace(this, identity)) throw new Error('工作簿已切换，取消恢复')
+        return restoreVersion(identity.workbookId, row.commitId, {
+          branchId: this.currentBranchId,
+          operationId: createOperationId(),
+          baseCommitId: this.headCommitId,
+          baseVersion: this.branchVersion,
+          commitMessage: '恢复到版本 #' + row.commitNo,
+          actionSchemaVersion: '2.0'
+        })
+      }).then(res => {
+        if (!sameWorkspace(this, identity)) throw new Error('历史恢复响应已过期')
         if (!res || res.code !== 200) throw new Error((res && res.msg) || '恢复失败')
         this.$modal.msgSuccess('恢复成功，已生成新的提交')
         this.versionDialogVisible = false
-        return getWorkbook(this.currentDocumentId)
+        return getVersionStatus(this.currentDocumentId)
       }).then(res => {
         if (res && res.code === 200 && res.data) {
+          if (!sameWorkspace(this, identity)) throw new Error('工作簿已切换，忽略恢复响应')
+          this.preserveLocalDraft()
           this.historyPreview = false
           this.loadUniverWorkbook(JSON.parse(res.data.content))
-          this.currentDocumentVersion = res.data.version
-          this.pendingChanges = []
-          this.pendingActions = []
-          this.loadVersionStatus()
+          this.applyVersionStatus(res.data, true)
+          this.loadedSnapshotFingerprint = JSON.stringify(this.getSnapshot())
         }
       }).catch(e => {
         if (e !== 'cancel' && e !== 'close') this.$modal.msgError('恢复失败：' + (e.message || String(e)))

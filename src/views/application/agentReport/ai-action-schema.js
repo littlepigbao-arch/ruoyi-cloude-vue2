@@ -336,6 +336,7 @@ export function clampRange(range, minR, maxR, minC, maxC) {
  * @returns {string|null} null 表示通过，字符串表示错误信息
  */
 export function validateAction(action) {
+  if (action && action._targetError) return action._targetError
   if (!action || typeof action !== 'object') return 'action 必须是对象'
   if (!action.type || typeof action.type !== 'string') return 'action.type 缺失'
   if (!ACTION_WHITELIST.includes(action.type)) return '未知指令类型: ' + action.type

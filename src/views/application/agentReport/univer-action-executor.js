@@ -33,6 +33,16 @@ export function executeActions(univerAPI, workbook, actions, options = {}) {
     return { results, summary: { ok, failed, skipped }, notes }
   }
   const total = Math.min(actions.length, MAX_ACTIONS)
+  // Validate every V2 write target before the first mutation in this group.
+  for (let i = 0; i < total; i++) {
+    const candidate = normalizeAction(actions[i])
+    if (!candidate || !candidate._requiresExplicitSheet) continue
+    const targetSheet = resolveSheet(workbook, candidate.sheetId, candidate.sheetName)
+    if (candidate._targetError || !targetSheet) {
+      results.push(fail(candidate.type, candidate.range, candidate._targetError || '目标 Sheet 不存在或冲突', Date.now()))
+      return { results, summary: { ok: 0, failed: 1, skipped: total - 1 }, notes }
+    }
+  }
   for (let i = 0; i < total; i++) {
     const action = normalizeAction(actions[i])
     if (options.onProgress) {
@@ -42,7 +52,7 @@ export function executeActions(univerAPI, workbook, actions, options = {}) {
         // ignore progress error
       }
     }
-    const r = executeAction(univerAPI, workbook, action, options)
+    const r = executeAction(univerAPI, workbook, actions[i], options)
     results.push(r)
     if (r.ok) ok++
     else failed++
@@ -109,11 +119,8 @@ export function resolveSheet(workbook, sheetId, sheetName) {
   if (!workbook) return null
   if (sheetId) {
     const byId = safeCall(() => workbook.getSheetBySheetId && workbook.getSheetBySheetId(sheetId))
-    if (byId) return byId
+    if (byId && (!sheetName || getSheetName(byId) === sheetName)) return byId
     return null
-  }
-  if (action.schemaVersion === '2.0' && !action.sheetId && !['undo', 'redo'].includes(type)) {
-    return fail(type, range, 'Action V2 缺少 target.sheetId', t0)
   }
   if (sheetName) {
     const byName = safeCall(() => workbook.getSheetByName && workbook.getSheetByName(sheetName))
@@ -134,11 +141,20 @@ export function normalizeAction(raw) {
   if (!raw || typeof raw !== 'object') return raw
   const action = Object.assign({}, raw)
   const target = raw.target && typeof raw.target === 'object' ? raw.target : {}
+  const v2 = raw.schemaVersion === '2.0' || (!raw.schemaVersion && !!raw.target)
+  const reads = ['getRangeValue', 'getRangeFormulas', 'getMerges', 'getSelection', 'getFilter']
+  action._requiresExplicitSheet = v2 && !reads.includes(raw.type)
+  if (raw.schemaVersion && !['1.0', '2.0'].includes(raw.schemaVersion)) action._targetError = '不支持的动作协议版本'
+  if (action._requiresExplicitSheet && (typeof target.sheetId !== 'string' || !target.sheetId.trim())) action._targetError = 'V2 写动作必须指定 target.sheetId'
+  for (const field of ['sheetId', 'sheetName', 'range']) {
+    if (target[field] && raw[field] && target[field] !== raw[field]) action._targetError = '目标字段冲突: ' + field
+  }
   action.sheetId = target.sheetId || raw.sheetId || null
   action.sheetName = target.sheetName || raw.sheetName || null
   action.range = target.range || raw.range || null
   if (action.range && action.range.indexOf('!') >= 0) {
     const split = splitSheetRange(action.range)
+    if (action.sheetName && action.sheetName !== split.sheetName) action._targetError = '区域前缀与 Sheet 名称冲突'
     if (!action.sheetName) action.sheetName = split.sheetName
     action.range = split.range
   }
