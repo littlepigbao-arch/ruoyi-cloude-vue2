@@ -242,6 +242,7 @@ import { saveAs } from 'file-saver'
 import AiChatPanel from './components/AiChatPanel.vue'
 import DocumentList from './components/DocumentList.vue'
 import { agentWorkspace } from '@/api/ai/agent'
+import { executeControlledWrite, sameControlledSnapshot } from './controlled-write-executor'
 import {
   listWorkbooks, getWorkbook, saveWorkbook, deleteWorkbook, renameWorkbook,
   getVersionStatus, saveWorkingState, createCommit, listCommits, getVersionSnapshot, restoreVersion,
@@ -302,6 +303,7 @@ export default {
       conflictDrafts: [],
       agentLocked: false,
       agentApplying: false,
+      controlledExecution: null,
       headCommitId: null,
       pendingChanges: [],
       pendingActions: [],
@@ -339,7 +341,8 @@ export default {
   computed: {
     agentWorkspaceAdapter() {
       return { lock: this.lockAgentWorkspace, prepare: this.prepareAgentWorkspace, apply: this.applyAgentSnapshot,
-        saved: this.refreshAgentDraft, reload: this.reloadAgentDraft }
+        saved: this.refreshAgentDraft, reload: this.reloadAgentDraft, applyControlled: this.applyControlledWrite,
+        acceptControlled: this.acceptControlledResult, syncControlled: this.syncControlledResult }
     }
   },
   mounted() {
@@ -377,7 +380,57 @@ export default {
       if (!response || response.code !== 200) throw new Error((response && response.msg) || '运行前草稿保存失败')
       if (!sameWorkspace(this, identity)) throw new Error('工作簿已切换，忽略旧保存响应')
       this.adoptSavedDraft(response.data, snapshot)
-      return agentWorkspace(this.currentDocumentId)
+      const state = await agentWorkspace(this.currentDocumentId)
+      if (!sameWorkspace(this, identity)) throw new Error('工作簿已切换，忽略旧工作区响应')
+      const sheet = this.univerAPI.getActiveWorkbook().getActiveSheet()
+      const selection = sheet.getActiveRange()
+      if (!selection || typeof selection.getA1Notation !== 'function') throw new Error('请先选中允许写入的目标区域')
+      state.activeSheetId = sheet.getSheetId()
+      state.writeScopes = [{ sheetId: state.activeSheetId, range: selection.getA1Notation() }]
+      return state
+    },
+    async applyControlledWrite(manifest) {
+      const identity = this.workspaceIdentity()
+      if (!this.agentLocked || String(manifest.workbookId) !== String(identity.workbookId) || String(manifest.branchId) !== String(identity.branchId) || manifest.loadedRevision !== this.loadedRevision) throw new Error('受控目标或版本已变化，保持保护')
+      if (this.controlledExecution && this.controlledExecution.callId === manifest.callId) throw new Error('同一调用不得重复执行，请核实结果')
+      this.agentSyncRequired = true
+      this.controlledExecution = { callId: manifest.callId, identity, fingerprint: null }
+      this.agentApplying = true; this.aiExecutionInProgress = true
+      try {
+        const result = await executeControlledWrite(this.univerAPI, this.univerAPI.getActiveWorkbook(), manifest)
+        if (!sameWorkspace(this, identity)) throw new Error('页面已切换，不能提交旧执行结果')
+        this.controlledExecution.fingerprint = JSON.stringify(this.getSnapshot())
+        return result
+      } finally { this.agentApplying = false; this.aiExecutionInProgress = false }
+    },
+    async acceptControlledResult(result) {
+      const executed = this.controlledExecution
+      if (!result || result.validation !== 'PASSED' || result.persistenceStatus !== 'SAVED' || !executed || executed.callId !== result.callId || !sameWorkspace(this, executed.identity) || !executed.fingerprint || executed.fingerprint !== JSON.stringify(this.getSnapshot())) throw new Error('执行结果或页面已变化，必须核实服务器草稿')
+      this.draftVersion = result.draftVersion; this.loadedRevision = result.loadedRevision
+      this.loadedSnapshotFingerprint = executed.fingerprint
+      if (result.executedChange && !this.pendingChanges.some(c => c.operationId === result.callId)) {
+        this.pendingChanges.push(result.executedChange)
+        this.pendingActions.push(...(result.actions || []))
+      }
+    },
+    async syncControlledResult(run) {
+      const identity = this.workspaceIdentity(), result = run.lastControlledResult
+      if (!result) return false
+      const state = await agentWorkspace(identity.workbookId)
+      if (!sameWorkspace(this, identity) || String(state.branchId) !== String(identity.branchId)) throw new Error('页面已切换，保持保护')
+      if (state.loadedRevision !== result.loadedRevision || state.draftVersion !== result.draftVersion) return false
+      if (!this.controlledExecution || this.controlledExecution.callId !== result.callId) {
+        // Other pages may apply only a proved single committed transition to an unchanged baseline.
+        const manifest = run.lastControlledManifest
+        if (!manifest || manifest.loadedRevision !== this.loadedRevision || JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint) return false
+        await this.applyControlledWrite(manifest)
+      }
+      await this.acceptControlledResult(result)
+      if (!sameControlledSnapshot(this.getSnapshot(), state.snapshot)) return false
+      this.applyVersionStatus({ branchId: state.branchId, branchName: state.branchName, version: state.branchVersion,
+        headCommitId: state.headCommitId, workbookVersion: state.workbookVersion, workingState: state.workingState }, true)
+      this.agentSyncRequired = false
+      return true
     },
     async applyAgentSnapshot(snapshot) {
       if (!this.agentLocked) throw new Error('工作区未锁定，拒绝执行')

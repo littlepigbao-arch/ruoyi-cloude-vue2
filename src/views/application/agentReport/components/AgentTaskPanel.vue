@@ -1,7 +1,8 @@
 <template>
   <section v-if="enabled || recoveryAvailable || syncRequired" class="agent-task">
     <div class="agent-controls">
-      <el-switch v-model="useAgent" active-text="计划执行" :disabled="busy || !snapshotWritesEnabled" @change="$emit('mode', $event)" />
+      <el-switch v-model="useAgent" active-text="计划执行" :disabled="busy || !(controlledWritesEnabled || snapshotWritesEnabled)" @change="$emit('mode', $event)" />
+      <span v-if="useAgent && controlledWritesEnabled">仅允许在当前选区写入普通值；开始前请确认选区。</span>
       <el-checkbox v-if="useAgent && !busy" v-model="allowOverwrite">允许覆盖目标区域已有内容</el-checkbox>
     </div>
     <template v-if="run && run.runId">
@@ -37,7 +38,7 @@ const TERMINAL = ['COMPLETED', 'CANCELLED', 'FAILED']
 export default {
   name: 'AgentTaskPanel',
   props: { workbookId: { type: [Number, String], default: null }, workspace: { type: Object, required: true } },
-  data: () => ({ enabled: false, recoveryAvailable: false, snapshotWritesEnabled: false, syncRequired: false, generation: 0,
+  data: () => ({ enabled: false, recoveryAvailable: false, snapshotWritesEnabled: false, controlledWritesEnabled: false, syncRequired: false, generation: 0,
     useAgent: false, allowOverwrite: false, run: null, events: [], error: '', answer: '', details: false,
     timer: null, heartbeatTimer: null, polling: false, operating: false, clientId: createOperationId(), pendingRequest: null }),
   computed: { activeRun() { return !!(this.run && this.run.runId && !TERMINAL.includes(this.run.status)) },
@@ -49,6 +50,7 @@ export default {
   async mounted() {
     try { const c = await agentCapabilities(); this.enabled = c.enabled; this.recoveryAvailable = c.recoveryAvailable;
       this.snapshotWritesEnabled = c.snapshotWritesEnabled === true;
+      this.controlledWritesEnabled = c.controlledWritesEnabled === true;
       if (this.enabled || this.recoveryAvailable) await this.attach() } catch (e) { this.error = '智能体服务暂不可用：' + e.message }
   },
   beforeDestroy() { this.generation++; clearTimeout(this.timer); clearInterval(this.heartbeatTimer) },
@@ -72,19 +74,21 @@ export default {
     },
     async synchronize(generation = this.generation) {
       this.syncRequired = true; this.workspace.lock(true)
-      await this.workspace.reload()
+      if (!(this.workspace.syncControlled && this.run && await this.workspace.syncControlled(this.run))) await this.workspace.reload()
       if (generation !== this.generation) throw new Error('页面已切换，保持保护状态')
       this.syncRequired = false
       if (!this.activeRun) { this.workspace.lock(false); this.$emit('busy', false) }
     },
     async start(goal, conversationId) {
-      if (!this.enabled || !this.snapshotWritesEnabled || this.busy || this.operating) throw new Error('A1 已阻断完整 Snapshot 智能体写入，可核实或取消已有任务')
+      if (!this.enabled || !(this.controlledWritesEnabled || this.snapshotWritesEnabled) || this.busy || this.operating) throw new Error('智能体写入入口未开启，可核实或取消已有任务')
       this.operating = true; this.error = ''; this.workspace.lock(true)
       try {
         const state = await this.workspace.prepare()
         // Retain this exact request when creation response is lost. User resubmits only after reconciliation.
         this.pendingRequest = { requestId: createOperationId(), goal, conversationId, workbookId: this.workbookId,
-          branchId: state.branchId, expectedRevision: state.revision, allowOverwrite: this.allowOverwrite }
+          branchId: state.branchId, expectedRevision: state.revision, allowOverwrite: this.allowOverwrite,
+          writeScopes: state.writeScopes, activeSheetId: state.activeSheetId, loadedRevision: state.loadedRevision,
+          expectedDraftVersion: state.draftVersion, expectedBranchVersion: state.branchVersion }
         try { this.run = await agentRequest('/runs', this.pendingRequest) }
         catch (e) { this.run = await agentRequest('/runs', this.pendingRequest) }
         this.events = []; this.schedule()
@@ -116,6 +120,21 @@ export default {
         const events = await agentRequest('/runs/' + id + '/events?after=' + after, null, 'get')
         if (generation !== this.generation || !this.run || this.run.runId !== id) return
         this.events = this.events.concat(events).slice(-200)
+        if (this.run.status === 'EXECUTING' && this.run.call && this.run.call.transportVersion === 2 && this.run.call.status === 'PENDING') {
+          const call = await agentRequest('/runs/' + id + '/controlled-claims', { clientId: this.clientId, fencingToken: this.run.fencingToken })
+          if (generation !== this.generation || !this.run || this.run.runId !== id) throw new Error('页面已切换，不执行旧调用')
+          if (call.claimToken && call.actions) {
+            const receipt = { transportVersion: 2, callId: call.callId, claimToken: call.claimToken, argsHash: call.argsHash, fencingToken: call.fencingToken, ok: false }
+            try { Object.assign(receipt, await this.workspace.applyControlled(call)) } catch (e) { this.error = e.message; receipt.error = e.message }
+            if (generation !== this.generation) throw new Error('页面已切换，执行结果待核实')
+            let acknowledged
+            try { acknowledged = await agentRequest('/runs/' + id + '/controlled-results', receipt) }
+            catch (e) { acknowledged = await agentRequest('/runs/' + id + '/controlled-results', receipt) }
+            if (generation !== this.generation || !this.run || this.run.runId !== id) return
+            this.run = acknowledged
+            if (receipt.ok) await this.workspace.acceptControlled(this.run.lastControlledResult)
+          }
+        }
         if (this.snapshotWritesEnabled && this.run.status === 'EXECUTING' && this.run.call && this.run.call.status === 'PENDING') {
           const call = await agentRequest('/runs/' + id + '/tool-claims', { clientId: this.clientId, fencingToken: this.run.fencingToken })
           if (call.callId) {
