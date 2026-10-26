@@ -60,7 +60,7 @@
       <!-- 消息列表 -->
       <div ref="body" class="ai-panel__body">
         <agent-task-panel ref="agent" :workbook-id="workbookId" :workspace="agentWorkspace"
-          @mode="agentMode = $event" @busy="agentBusy = $event" />
+          @mode="agentMode = $event" @busy="agentBusy = $event" @ordinary-result="onOrdinaryResult" />
         <div v-if="messages.length === 0" class="ai-empty">
           <i class="el-icon-chat-line-square"></i>
           <p>输入中文指令操纵表格，例如：</p>
@@ -186,7 +186,8 @@
 import { sendChat, getHistory } from '@/api/ai/chat'
 import { collectContext } from '../univer-context'
 import { executeActions } from '../univer-action-executor'
-import { buildExecutedChanges, createOperationId } from '../change-capture'
+import { createOperationId } from '../change-capture'
+import { classifyAiActions } from '../controlled-write-executor'
 import ChartCard from './ChartCard.vue'
 import AgentTaskPanel from './AgentTaskPanel.vue'
 
@@ -421,13 +422,13 @@ export default {
         })
         if (context) context.workbookId = workbookId
         const operationId = createOperationId()
-        const checkpoint = workbook.save()
+        const authorization = this.agentWorkspace.captureAuthorization ? this.$refs.agent.captureOrdinaryAuthorization() : null
         const resp = await sendChat(
           {
             message: userText,
             conversationId: this.conversationId,
             context: context,
-            clientMeta: { locale: 'zh-CN', univerVersion: '0.25.1' }
+            clientMeta: { locale: 'zh-CN', univerVersion: '0.25.1', controlledWriteTransport: 2 }
           },
           { useMock: this.useMock, allowMockFallback: this.allowMockFallback }
         )
@@ -442,6 +443,16 @@ export default {
           }
         }
         const actions = (resp && resp.data && resp.data.actions) || []
+        const mode = classifyAiActions(actions, this.$refs.agent && this.$refs.agent.controlledActions)
+        if (mode === 'controlled-values') {
+          const conversation = resp.source ? null : this.conversationId
+          const run = await this.$refs.agent.startActions(actions, conversation, authorization, operationId, userText)
+          if (this.workbook !== workbook || String(this.workbookId) !== String(workbookId)) return
+          this.messages.push({ role: 'assistant', content: '正在受控执行，结果与草稿保存完成后会在此回复。',
+            controlledRunId: run.runId, proposedReply: (resp.data && resp.data.reply) || '', controlledStatus: run.status })
+          return
+        }
+        // Only the explicitly classified read/display group reaches the legacy local dispatcher.
         let exec
         this.$emit('execution-state', true)
         try {
@@ -454,18 +465,6 @@ export default {
         } finally {
           this.$emit('execution-state', false)
         }
-        let capture = { operationId, groupId: null, changes: [] }
-        if (exec.summary.failed > 0) {
-          this.$emit('rollback', checkpoint)
-          exec.rolledBack = true
-          exec.notes.push('动作组执行失败，已恢复执行前工作簿')
-        } else {
-          const afterSnapshot = this.workbook.save()
-          capture = buildExecutedChanges(actions, exec.results, checkpoint, afterSnapshot, {
-            operationId,
-            source: 'ai'
-          })
-        }
         this.messages.push({
           role: 'assistant',
           content: (resp && resp.data && resp.data.reply) || '(无回复)',
@@ -473,14 +472,7 @@ export default {
           summary: exec.summary,
           notes: exec.notes
         })
-        this.$emit('executed', Object.assign({}, exec, {
-          plannedActions: actions,
-          executedChanges: capture.changes,
-          operationId: capture.operationId,
-          groupId: capture.groupId,
-          userInstruction: userText,
-          modelReply: (resp && resp.data && resp.data.reply) || ''
-        }))
+        // Read/display never emits a mutation or schedules Working State autosave.
       } catch (e) {
         this.messages.push({
           role: 'assistant',
@@ -490,6 +482,23 @@ export default {
       } finally {
         this.loading = false
         this.execProgress = ''
+      }
+    },
+
+    onOrdinaryResult({ run, error }) {
+      const message = this.messages.find(m => m.controlledRunId === run.runId)
+      if (!message) return
+      message.controlledStatus = run.status
+      if (!error && run.status === 'COMPLETED' && run.lastControlledResult && run.lastControlledResult.persistenceStatus === 'SAVED') {
+        message.content = (message.proposedReply ? message.proposedReply + '\n' : '') + '已回读验证并保存草稿；正式版本请主动提交。'
+        const actions = run.lastControlledResult.actions || []
+        this.$set(message, 'execResults', actions.map(a => ({ type: a.type, range: a.target && a.target.range, ok: true })))
+        this.$set(message, 'summary', { ok: actions.length, failed: 0, skipped: 0 })
+        this.$set(message, 'notes', [])
+        this.$set(message, 'error', false)
+      } else if (error || ['PAUSED', 'CANCELLING', 'FAILED', 'CANCELLED'].includes(run.status)) {
+        message.content = run.status === 'CANCELLED' ? '任务已停止，已保存的结果保留。' : (error || run.message || '执行结果尚未核实') + '；未报告完成，请核实或取消。'
+        this.$set(message, 'error', true)
       }
     },
 

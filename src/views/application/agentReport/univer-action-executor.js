@@ -94,7 +94,7 @@ export function executeAction(univerAPI, workbook, action, options = {}) {
   }
   // 4. 执行
   try {
-    const ret = handler(univerAPI, sheet, action)
+    const ret = handler(univerAPI, sheet, action, options)
     return {
       type,
       range: range || null,
@@ -268,7 +268,7 @@ function handleSetCell(univerAPI, sheet, action) {
   return note ? { note } : null
 }
 
-function handleSetCellForCell(univerAPI, sheet, action) {
+function handleSetCellForCell(univerAPI, sheet, action, options = {}) {
   const { fRange, note } = resolveRange(sheet, action.range)
   let value = action.value
   if (action.isFormula === true || (typeof value === 'string' && value.startsWith('='))) {
@@ -278,7 +278,11 @@ function handleSetCellForCell(univerAPI, sheet, action) {
     if (r !== true) throw new Error(r)
     value = formula
   }
-  fRange.setValueForCell(value)
+  // Controlled scalar aliases keep their declared primitive type. Without t,
+  // Univer may infer a number/boolean or change number formatting from a string.
+  fRange.setValueForCell(options.controlledValues
+    ? { v: value, t: typeof value === 'number' ? 2 : typeof value === 'boolean' ? 3 : 1, p: null, f: null, si: null }
+    : value)
   return note ? { note } : null
 }
 
@@ -315,9 +319,15 @@ function handleSetValues(univerAPI, sheet, action) {
   return note ? { note } : null
 }
 
-function handleClearRange(univerAPI, sheet, action) {
+function handleClearRange(univerAPI, sheet, action, options = {}) {
   const { fRange, note } = resolveRange(sheet, action.range)
   const what = action.clearWhat || 'content'
+  if (options.controlledValues) {
+    const clear = options.controlledContentClears && options.controlledContentClears.get(getSheetId(sheet) + ':' + action.range)
+    if (what !== 'content' || !clear || note) throw new Error('受控内容清除未通过完整预检')
+    clear()
+    return null
+  }
   // facade 提供 clearContent()/clearFormat()/clear()，比 setValue(null) 更可靠
   // setValue(null) 会被 covertCellValue 校验拒绝并抛 "Invalid value"
   if (what === 'content') {
@@ -468,45 +478,37 @@ function handleDeleteColumns(univerAPI, sheet, action) {
 }
 
 function handleSetRowHeight(univerAPI, sheet, action) {
-  sheet.setRowHeight(Number(action.rowPosition) - 1, Number(action.height)) // 1-based → 0-based
+  const result = sheet.setRowHeight(Number(action.rowPosition) - 1, Number(action.height)) // 1-based → 0-based
+  if (result === false || (result && typeof result === 'object' && (result.error || result.ok === false))) throw new Error('行高 setter 报告失败')
   return null
 }
 
 function handleSetColumnWidth(univerAPI, sheet, action) {
-  sheet.setColumnWidth(Number(action.columnPosition) - 1, Number(action.width)) // 1-based → 0-based
+  const result = sheet.setColumnWidth(Number(action.columnPosition) - 1, Number(action.width)) // 1-based → 0-based
+  if (result === false || (result && typeof result === 'object' && (result.error || result.ok === false))) throw new Error('列宽 setter 报告失败')
   return null
 }
 
 function handleSetStyle(univerAPI, sheet, action) {
   const { fRange, note } = resolveRange(sheet, action.range)
   const s = action
-  try {
-    if (s.background) fRange.setBackgroundColor(s.background)
-  } catch (e) {}
-  try {
-    if (s.fontColor) fRange.setFontColor(s.fontColor)
-  } catch (e) {}
-  try {
-    if (s.fontSize !== undefined) fRange.setFontSize(Number(s.fontSize))
-  } catch (e) {}
-  try {
-    if (s.fontFamily) fRange.setFontFamily(s.fontFamily)
-  } catch (e) {}
-  try {
-    if (s.fontWeight) fRange.setFontWeight(s.fontWeight)
-  } catch (e) {}
-  try {
-    if (s.hAlign) fRange.setHorizontalAlignment(s.hAlign)
-  } catch (e) {}
-  try {
-    if (s.vAlign) fRange.setVerticalAlignment(s.vAlign)
-  } catch (e) {}
-  try {
-    if (typeof s.wrap === 'boolean') fRange.setWrap(s.wrap)
-  } catch (e) {}
-  try {
-    if (s.textRotation !== undefined) fRange.setTextRotation(Number(s.textRotation))
-  } catch (e) {}
+  const setters = [
+    ['background', 'setBackgroundColor', s.background],
+    ['fontColor', 'setFontColor', s.fontColor],
+    ['fontSize', 'setFontSize', s.fontSize],
+    ['fontFamily', 'setFontFamily', s.fontFamily],
+    ['fontWeight', 'setFontWeight', s.fontWeight],
+    ['hAlign', 'setHorizontalAlignment', s.hAlign],
+    ['vAlign', 'setVerticalAlignment', s.vAlign],
+    ['wrap', 'setWrap', s.wrap],
+    ['textRotation', 'setTextRotation', s.textRotation]
+  ]
+  for (const [field, method, value] of setters) {
+    if (value === undefined || value === null || value === '') continue
+    if (typeof fRange[method] !== 'function') throw new Error('当前 Univer 版本不支持样式属性: ' + field)
+    const result = fRange[method](value)
+    if (result === false || (result && typeof result === 'object' && (result.error || result.ok === false))) throw new Error('样式属性写入失败: ' + field)
+  }
   return note ? { note } : null
 }
 

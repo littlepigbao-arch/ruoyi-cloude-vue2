@@ -242,7 +242,7 @@ import { saveAs } from 'file-saver'
 import AiChatPanel from './components/AiChatPanel.vue'
 import DocumentList from './components/DocumentList.vue'
 import { agentWorkspace } from '@/api/ai/agent'
-import { executeControlledWrite, sameControlledSnapshot } from './controlled-write-executor'
+import { executeControlledWrite, sameControlledSnapshot, sameControlledFormatSnapshot, sameControlledFormatTransition } from './controlled-write-executor'
 import {
   listWorkbooks, getWorkbook, saveWorkbook, deleteWorkbook, renameWorkbook,
   getVersionStatus, saveWorkingState, createCommit, listCommits, getVersionSnapshot, restoreVersion,
@@ -342,7 +342,7 @@ export default {
     agentWorkspaceAdapter() {
       return { lock: this.lockAgentWorkspace, prepare: this.prepareAgentWorkspace, apply: this.applyAgentSnapshot,
         saved: this.refreshAgentDraft, reload: this.reloadAgentDraft, applyControlled: this.applyControlledWrite,
-        acceptControlled: this.acceptControlledResult, syncControlled: this.syncControlledResult }
+        acceptControlled: this.acceptControlledResult, syncControlled: this.syncControlledResult, captureAuthorization: this.captureAgentAuthorization }
     }
   },
   mounted() {
@@ -370,8 +370,15 @@ export default {
       this.agentLocked = value
       if (value) { clearTimeout(this.autosaveTimer); this.autosaveTimer = null }
     },
-    async prepareAgentWorkspace() {
+    captureAgentAuthorization() {
+      const sheet = this.univerAPI.getActiveWorkbook().getActiveSheet(), selection = sheet.getActiveRange()
+      return { identity: this.workspaceIdentity(), loadedRevision: this.loadedRevision, draftVersion: this.draftVersion,
+        branchVersion: this.branchVersion, fingerprint: JSON.stringify(this.getSnapshot()), activeSheetId: sheet.getSheetId(),
+        writeScopes: selection && typeof selection.getA1Notation === 'function' ? [{ sheetId: sheet.getSheetId(), range: selection.getA1Notation() }] : [] }
+    },
+    async prepareAgentWorkspace(authorization) {
       if (!this.currentDocumentId || !this.currentBranchId || this.historyPreview || this.persistBusy) throw new Error('请先保存并打开可编辑的工作簿')
+      if (authorization && (!sameWorkspace(this, authorization.identity) || authorization.loadedRevision !== this.loadedRevision || authorization.draftVersion !== this.draftVersion || authorization.branchVersion !== this.branchVersion || authorization.fingerprint !== JSON.stringify(this.getSnapshot()))) throw new Error('WRITE_VERSION_CONFLICT: 等待 AI 回复期间工作区已变化，请保留编辑并重新发起请求')
       this.flushManualChanges(true)
       const snapshot = this.getSnapshot()
       if (!snapshot) throw new Error('无法获取当前工作簿')
@@ -382,16 +389,16 @@ export default {
       this.adoptSavedDraft(response.data, snapshot)
       const state = await agentWorkspace(this.currentDocumentId)
       if (!sameWorkspace(this, identity)) throw new Error('工作簿已切换，忽略旧工作区响应')
-      const sheet = this.univerAPI.getActiveWorkbook().getActiveSheet()
-      const selection = sheet.getActiveRange()
-      if (!selection || typeof selection.getA1Notation !== 'function') throw new Error('请先选中允许写入的目标区域')
-      state.activeSheetId = sheet.getSheetId()
-      state.writeScopes = [{ sheetId: state.activeSheetId, range: selection.getA1Notation() }]
+      const captured = authorization || this.captureAgentAuthorization()
+      if (!captured.writeScopes.length) throw new Error('请先选中允许写入的目标区域')
+      state.activeSheetId = captured.activeSheetId
+      state.writeScopes = captured.writeScopes
       return state
     },
     async applyControlledWrite(manifest) {
       const identity = this.workspaceIdentity()
       if (!this.agentLocked || String(manifest.workbookId) !== String(identity.workbookId) || String(manifest.branchId) !== String(identity.branchId) || manifest.loadedRevision !== this.loadedRevision) throw new Error('受控目标或版本已变化，保持保护')
+      if (!this.loadedSnapshotFingerprint || JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint) throw new Error('WRITE_VERSION_CONFLICT: 受控执行前本地工作簿已变化，请核实服务器草稿')
       if (this.controlledExecution && this.controlledExecution.callId === manifest.callId) throw new Error('同一调用不得重复执行，请核实结果')
       this.agentSyncRequired = true
       this.controlledExecution = { callId: manifest.callId, identity, fingerprint: null }
@@ -413,19 +420,59 @@ export default {
         this.pendingActions.push(...(result.actions || []))
       }
     },
-    async syncControlledResult(run) {
+    async syncControlledResult(run, isCurrent = () => true) {
       const identity = this.workspaceIdentity(), result = run.lastControlledResult
       if (!result) return false
       const state = await agentWorkspace(identity.workbookId)
-      if (!sameWorkspace(this, identity) || String(state.branchId) !== String(identity.branchId)) throw new Error('页面已切换，保持保护')
+      if (!isCurrent() || !sameWorkspace(this, identity) || String(state.branchId) !== String(identity.branchId)) throw new Error('页面或任务核实操作已切换，保持保护')
       if (state.loadedRevision !== result.loadedRevision || state.draftVersion !== result.draftVersion) return false
+      const manifest = run.lastControlledManifest
+      if (manifest && manifest.patch) {
+        if (manifest.callId !== result.callId || result.validation !== 'PASSED' || result.persistenceStatus !== 'SAVED') throw new Error('RESULT_UNKNOWN: 格式调用缺少可信保存结果')
+        // A later poll can see the same committed call after the first authoritative reload.
+        // Verify the unchanged local baseline against that same server draft before acknowledging it again.
+        if (this.loadedRevision === result.loadedRevision && this.draftVersion === result.draftVersion) {
+          if (JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint ||
+            !sameControlledFormatSnapshot(this.getSnapshot(), state.snapshot, manifest.patch)) {
+            this.agentSyncRequired = true
+            this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 格式保存后页面已变化，保持保护')
+          }
+          this.agentSyncRequired = false
+          return true
+        }
+        const executed = this.controlledExecution && this.controlledExecution.callId === result.callId ? this.controlledExecution : null
+        if (executed) {
+          if (!sameWorkspace(this, executed.identity) || !executed.fingerprint || executed.fingerprint !== JSON.stringify(this.getSnapshot())) throw new Error('RESULT_UNKNOWN: 格式执行后页面已变化，保持保护')
+          if (!sameControlledFormatSnapshot(this.getSnapshot(), state.snapshot, manifest.patch)) {
+            this.agentSyncRequired = true
+            this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 格式执行回读与服务器草稿不一致，保留页面并核实')
+          }
+        } else {
+          if (manifest.loadedRevision !== this.loadedRevision || JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint) throw new Error('RESULT_UNKNOWN: 格式恢复基线已变化，保持保护')
+          if (!sameControlledFormatTransition(this.getSnapshot(), state.snapshot, manifest.patch)) {
+            this.agentSyncRequired = true
+            this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 格式草稿含目标外变化，保留页面并核实')
+          }
+        }
+        const reloaded = await this.reloadAgentDraft(isCurrent, { skipPreserve: !!executed })
+        if (!isCurrent() || reloaded.loadedRevision !== result.loadedRevision || reloaded.draftVersion !== result.draftVersion || !sameControlledFormatSnapshot(this.getSnapshot(), reloaded.snapshot, manifest.patch)) {
+          this.agentSyncRequired = true
+          this.lockAgentWorkspace(true)
+          throw new Error('RESULT_UNKNOWN: 格式保存后服务器草稿与页面回读不一致，保持保护')
+        }
+        return true
+      }
       if (!this.controlledExecution || this.controlledExecution.callId !== result.callId) {
         // Other pages may apply only a proved single committed transition to an unchanged baseline.
-        const manifest = run.lastControlledManifest
         if (!manifest || manifest.loadedRevision !== this.loadedRevision || JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint) return false
         await this.applyControlledWrite(manifest)
       }
+      if (!isCurrent()) throw new Error('任务核实操作已切换，保持保护')
       await this.acceptControlledResult(result)
+      if (!isCurrent()) throw new Error('任务核实操作已切换，保持保护')
       if (!sameControlledSnapshot(this.getSnapshot(), state.snapshot)) return false
       this.applyVersionStatus({ branchId: state.branchId, branchName: state.branchName, version: state.branchVersion,
         headCommitId: state.headCommitId, workbookVersion: state.workbookVersion, workingState: state.workingState }, true)
@@ -459,16 +506,16 @@ export default {
     async refreshAgentDraft() {
       return this.reloadAgentDraft()
     },
-    async reloadAgentDraft() {
+    async reloadAgentDraft(isCurrent = () => true, options = {}) {
       const identity = this.workspaceIdentity()
       this.agentSyncRequired = true
       this.lockAgentWorkspace(true)
       const state = await agentWorkspace(this.currentDocumentId)
-      if (!sameWorkspace(this, identity) || String(state.workbookId) !== String(identity.workbookId) || String(state.branchId) !== String(identity.branchId)) throw new Error('工作簿或分支已变化，忽略旧同步响应')
+      if (!isCurrent() || !sameWorkspace(this, identity) || String(state.workbookId) !== String(identity.workbookId) || String(state.branchId) !== String(identity.branchId)) throw new Error('工作簿、分支或任务核实操作已变化，忽略旧同步响应')
       if (!state.loadedRevision || !Number.isInteger(state.draftVersion) || !state.snapshot) throw new Error('服务器同步版本信息不完整')
-      this.preserveLocalDraft()
+      if (!options.skipPreserve) this.preserveLocalDraft()
       await this.applyAgentSnapshot(state.snapshot)
-      if (!sameWorkspace(this, identity)) throw new Error('工作簿已变化，保持保护状态')
+      if (!isCurrent() || !sameWorkspace(this, identity)) throw new Error('工作簿或任务核实操作已变化，保持保护状态')
       this.applyVersionStatus({ branchId: state.branchId, branchName: state.branchName, version: state.branchVersion,
         headCommitId: state.headCommitId, workbookVersion: state.workbookVersion, workingState: state.workingState }, true)
       this.draftVersion = state.draftVersion
