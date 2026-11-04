@@ -12,3 +12,10 @@ export function sameWorkspace(state, identity) {
   return String(state.currentDocumentId) === String(identity.workbookId) &&
     String(state.currentBranchId) === String(identity.branchId) && state.workspaceGeneration === identity.generation
 }
+
+/** Commit and restore consume exactly the draft baseline loaded by this page. */
+export function versionMutationBinding(state) {
+  if (!state.currentBranchId || !Number.isInteger(state.branchVersion) || !Number.isInteger(state.draftVersion) || state.draftVersion < -1 || !state.loadedRevision) throw new Error('页面尚未核实版本，请保留编辑并重新加载')
+  return { branchId: state.currentBranchId, baseCommitId: state.headCommitId, baseVersion: state.branchVersion,
+    expectedDraftVersion: state.draftVersion, loadedRevision: state.loadedRevision }
+}

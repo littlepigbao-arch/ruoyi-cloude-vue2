@@ -302,6 +302,7 @@ export function assertSafeFormula(formula) {
   for (const p of DANGEROUS_PATTERNS) {
     if (p.test(f)) return '不允许的公式函数（含外部链接/网络）'
   }
+  if (/^=\$?[A-Z]{1,3}\$?[1-9][0-9]*[+*/-]\$?[A-Z]{1,3}\$?[1-9][0-9]*$/.test(f)) return true
   // 白名单函数匹配（取首个函数名）
   if (!SAFE_FORMULA_FN.test(f)) {
     const m = f.match(/^=\s*([A-Z]+)/i)

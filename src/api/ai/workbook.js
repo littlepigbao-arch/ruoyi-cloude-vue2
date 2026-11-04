@@ -46,7 +46,7 @@ export function getWorkbook(workbookId) {
 }
 
 /**
- * 保存/更新文档
+ * 新建文档；已有文档内容使用 saveWorkingState，名称使用 renameWorkbook。
  * @param {object} payload {workbookId?, name, type, content}
  * @returns {Promise<{code,msg,data}>}
  */
@@ -78,6 +78,10 @@ export function getVersionStatus(workbookId) {
 
 export function saveWorkingState(workbookId, payload, onUploadProgress) {
   return wbHttp.put('/ai/workbook/' + workbookId + '/working-state', payload, uploadConfig(onUploadProgress))
+}
+
+export function discardWorkingState(workbookId, payload) {
+  return wbHttp.delete('/ai/workbook/' + workbookId + '/working-state', { data: payload })
 }
 
 export function createCommit(workbookId, payload, onUploadProgress) {

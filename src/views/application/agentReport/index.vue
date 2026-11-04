@@ -2,11 +2,13 @@
   <div class="app-container">
     <el-alert v-if="conflictDrafts.length" title="已保留同步前的本地编辑草稿，可下载后进行人工合并" type="warning" :closable="false" />
     <el-button v-if="conflictDrafts.length" size="mini" @click="downloadConflictDrafts">下载保留的编辑草稿</el-button>
+    <el-button v-if="branchCheckoutUncertain && !versionDialogVisible" :disabled="persistBusy" size="mini" type="warning" @click="reconcileBranchCheckout">核实分支切换</el-button>
     <el-row :gutter="10" class="mb8">
       <el-col :span="1.5">
         <el-upload
           class="upload-demo"
           action="#"
+          :auto-upload="false"
           :show-file-list="false"
           :before-upload="beforeUpload"
           :on-change="handleFileChange"
@@ -38,7 +40,8 @@
           size="mini"
           @click="handleExport"
           :disabled="!hasData"
-        >导出Excel</el-button>
+        >导出Excel数据</el-button>
+        <el-button plain size="mini" :disabled="!hasData" @click="handleSnapshotExport">完整备份JSON</el-button>
       </el-col>
       <el-col :span="1.5">
         <el-button
@@ -165,8 +168,11 @@
         type="info" :closable="false" class="mb8"
       />
       <el-form inline size="mini">
+        <el-form-item v-if="branchCheckoutUncertain">
+          <el-button type="warning" :disabled="persistBusy" @click="reconcileBranchCheckout">核实分支切换</el-button>
+        </el-form-item>
         <el-form-item label="切换分支">
-          <el-select v-model="selectedBranchId" style="width:190px" @change="checkoutSelectedBranch">
+          <el-select v-model="selectedBranchId" style="width:190px" :disabled="agentLocked || agentSyncRequired || persistBusy || historyPreview" @change="checkoutSelectedBranch">
             <el-option v-for="item in branches" :key="item.branchId" :label="item.branchName" :value="item.branchId" />
           </el-select>
         </el-form-item>
@@ -186,6 +192,7 @@
         </el-form-item>
         <el-form-item>
           <el-button type="primary" :disabled="!pendingChanges.length" :loading="commitLoading" @click="commitPendingChanges">提交</el-button>
+          <el-button type="danger" plain :disabled="agentLocked || persistBusy || historyPreview || draftVersion < 0" @click="discardCurrentDraft">丢弃已保存草稿</el-button>
         </el-form-item>
       </el-form>
       <el-table :data="commitHistory" size="mini" max-height="420">
@@ -241,15 +248,16 @@ import * as XLSX from 'xlsx'
 import { saveAs } from 'file-saver'
 import AiChatPanel from './components/AiChatPanel.vue'
 import DocumentList from './components/DocumentList.vue'
-import { agentWorkspace } from '@/api/ai/agent'
-import { executeControlledWrite, sameControlledSnapshot, sameControlledFormatSnapshot, sameControlledFormatTransition } from './controlled-write-executor'
+import { agentWorkspace, activeAgent } from '@/api/ai/agent'
+import { executeControlledWrite, sameControlledSnapshot, sameControlledFormatSnapshot, sameControlledFormatTransition, sameControlledFilterSnapshot, sameControlledFilterTransition, sameControlledFormulaSnapshot, sameControlledFormulaTransition, sameControlledMergeSnapshot, sameControlledMergeTransition, sameControlledStructureSnapshot, sameControlledStructureTransition } from './controlled-write-executor'
 import {
   listWorkbooks, getWorkbook, saveWorkbook, deleteWorkbook, renameWorkbook,
-  getVersionStatus, saveWorkingState, createCommit, listCommits, getVersionSnapshot, restoreVersion,
+  getVersionStatus, saveWorkingState, discardWorkingState, createCommit, listCommits, getVersionSnapshot, restoreVersion,
   listBranches, createBranch, checkoutBranch, fastForwardBranchToMain
 } from '@/api/ai/workbook'
 import { createOperationId, buildManualChanges, buildLightweightManualChanges } from './change-capture'
-import { workingStatePayload, sameWorkspace } from './working-state-sync'
+import { workingStatePayload, sameWorkspace, versionMutationBinding } from './working-state-sync'
+import { exportWorkbook, exportSheet } from './excel-export'
 
 const LARGE_DATA_CELL_THRESHOLD = 200000
 const LARGE_DATA_ROW_THRESHOLD = 20000
@@ -299,6 +307,9 @@ export default {
       loadedRevision: null,
       loadedSnapshotFingerprint: null,
       workspaceGeneration: 0,
+      branchCheckoutUncertain: false,
+      excelImportGeneration: 0,
+      pendingExcelImport: null,
       agentSyncRequired: false,
       conflictDrafts: [],
       agentLocked: false,
@@ -342,7 +353,7 @@ export default {
     agentWorkspaceAdapter() {
       return { lock: this.lockAgentWorkspace, prepare: this.prepareAgentWorkspace, apply: this.applyAgentSnapshot,
         saved: this.refreshAgentDraft, reload: this.reloadAgentDraft, applyControlled: this.applyControlledWrite,
-        acceptControlled: this.acceptControlledResult, syncControlled: this.syncControlledResult, captureAuthorization: this.captureAgentAuthorization }
+        acceptControlled: this.acceptControlledResult, syncControlled: this.syncControlledResult, captureAuthorization: this.captureAgentAuthorization, captureReadSelection: this.captureReadSelection }
     }
   },
   mounted() {
@@ -358,6 +369,7 @@ export default {
     this.fetchDocuments()
   },
   beforeDestroy() {
+    this.cancelExcelImport()
     clearTimeout(this.autosaveTimer)
     this.autosaveTimer = null
     clearInterval(this.persistProgressTimer)
@@ -367,8 +379,17 @@ export default {
   methods: {
     lockAgentWorkspace(value) {
       if (!value && this.agentSyncRequired) return
+      if (value) this.cancelExcelImport()
       this.agentLocked = value
       if (value) { clearTimeout(this.autosaveTimer); this.autosaveTimer = null }
+    },
+    captureReadSelection() {
+      const sheet = this.univerAPI.getActiveWorkbook().getActiveSheet()
+      const range = sheet.getActiveRange(), cell = sheet.getActiveCell()
+      if (!range) return null
+      const raw = cell && (typeof cell.getRange === 'function' ? cell.getRange() : cell._range)
+      return { sheetId: sheet.getSheetId(), range: range.getA1Notation(),
+        activeCell: raw ? { row: raw.startRow, column: raw.startColumn } : null }
     },
     captureAgentAuthorization() {
       const sheet = this.univerAPI.getActiveWorkbook().getActiveSheet(), selection = sheet.getActiveRange()
@@ -427,6 +448,130 @@ export default {
       if (!isCurrent() || !sameWorkspace(this, identity) || String(state.branchId) !== String(identity.branchId)) throw new Error('页面或任务核实操作已切换，保持保护')
       if (state.loadedRevision !== result.loadedRevision || state.draftVersion !== result.draftVersion) return false
       const manifest = run.lastControlledManifest
+      if (manifest && manifest.structurePatch) {
+        if (manifest.callId !== result.callId || result.validation !== 'PASSED' || result.persistenceStatus !== 'SAVED') throw new Error('RESULT_UNKNOWN: 结构调用缺少可信保存结果')
+        const patch = manifest.structurePatch
+        if (this.loadedRevision === result.loadedRevision && this.draftVersion === result.draftVersion) {
+          if (JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint || !sameControlledStructureSnapshot(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 结构保存后页面已变化，保持保护')
+          }
+          if (patch.type === 'deleteSheet' && this.getSnapshot().activeSheet === patch.sheetId) {
+            const restored = await this.reloadAgentDraft(isCurrent, { skipPreserve: true })
+            if (!isCurrent() || restored.loadedRevision !== result.loadedRevision || this.getSnapshot().activeSheet !== patch.fallbackSheetId || !sameControlledStructureSnapshot(this.getSnapshot(), restored.snapshot, patch)) throw new Error('RESULT_UNKNOWN: 删除后活动 Sheet 恢复失败，保持保护')
+          }
+          this.agentSyncRequired = false
+          return true
+        }
+        const executed = this.controlledExecution && this.controlledExecution.callId === result.callId ? this.controlledExecution : null
+        if (executed) {
+          if (!sameWorkspace(this, executed.identity) || !executed.fingerprint || executed.fingerprint !== JSON.stringify(this.getSnapshot()) || !sameControlledStructureSnapshot(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 结构执行与服务器草稿不一致，保持保护')
+          }
+        } else {
+          if (manifest.loadedRevision !== this.loadedRevision || JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint || !sameControlledStructureTransition(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 结构恢复含目标外变化，保持保护')
+          }
+        }
+        const reloaded = await this.reloadAgentDraft(isCurrent, { skipPreserve: !!executed })
+        if (!isCurrent() || reloaded.loadedRevision !== result.loadedRevision || reloaded.draftVersion !== result.draftVersion || !sameControlledStructureSnapshot(this.getSnapshot(), reloaded.snapshot, patch)) {
+          this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+          throw new Error('RESULT_UNKNOWN: 结构重载与可信草稿不一致，保持保护')
+        }
+        return true
+      }
+      if (manifest && manifest.mergePatch) {
+        if (manifest.callId !== result.callId || result.validation !== 'PASSED' || result.persistenceStatus !== 'SAVED') throw new Error('RESULT_UNKNOWN: 合并调用缺少可信保存结果')
+        const patch = manifest.mergePatch
+        if (this.loadedRevision === result.loadedRevision && this.draftVersion === result.draftVersion) {
+          if (JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint || !sameControlledMergeSnapshot(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 合并保存后页面已变化，保持保护')
+          }
+          this.agentSyncRequired = false
+          return true
+        }
+        const executed = this.controlledExecution && this.controlledExecution.callId === result.callId ? this.controlledExecution : null
+        if (executed) {
+          if (!sameWorkspace(this, executed.identity) || !executed.fingerprint || executed.fingerprint !== JSON.stringify(this.getSnapshot()) || !sameControlledMergeSnapshot(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 合并执行与服务器草稿不一致，保持保护')
+          }
+        } else {
+          if (manifest.loadedRevision !== this.loadedRevision || JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint || !sameControlledMergeTransition(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 合并恢复含目标外变化，保持保护')
+          }
+        }
+        const reloaded = await this.reloadAgentDraft(isCurrent, { skipPreserve: !!executed })
+        if (!isCurrent() || reloaded.loadedRevision !== result.loadedRevision || reloaded.draftVersion !== result.draftVersion || !sameControlledMergeSnapshot(this.getSnapshot(), reloaded.snapshot, patch)) {
+          this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+          throw new Error('RESULT_UNKNOWN: 合并重载与可信草稿不一致，保持保护')
+        }
+        return true
+      }
+      if (manifest && manifest.formulaPatch) {
+        if (manifest.callId !== result.callId || result.validation !== 'PASSED' || result.persistenceStatus !== 'SAVED') throw new Error('RESULT_UNKNOWN: 公式调用缺少可信保存结果')
+        const patch = manifest.formulaPatch
+        if (this.loadedRevision === result.loadedRevision && this.draftVersion === result.draftVersion) {
+          if (JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint || !sameControlledFormulaSnapshot(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 公式保存后页面已变化，保持保护')
+          }
+          this.agentSyncRequired = false
+          return true
+        }
+        const executed = this.controlledExecution && this.controlledExecution.callId === result.callId ? this.controlledExecution : null
+        if (executed) {
+          if (!sameWorkspace(this, executed.identity) || !executed.fingerprint || executed.fingerprint !== JSON.stringify(this.getSnapshot()) || !sameControlledFormulaSnapshot(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 公式执行与服务器草稿不一致，保持保护')
+          }
+        } else {
+          if (manifest.loadedRevision !== this.loadedRevision || JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint || !sameControlledFormulaTransition(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 公式恢复含目标外变化，保持保护')
+          }
+        }
+        const reloaded = await this.reloadAgentDraft(isCurrent, { skipPreserve: !!executed })
+        if (!isCurrent() || reloaded.loadedRevision !== result.loadedRevision || reloaded.draftVersion !== result.draftVersion || !sameControlledFormulaSnapshot(this.getSnapshot(), reloaded.snapshot, patch)) {
+          this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+          throw new Error('RESULT_UNKNOWN: 公式重载与可信草稿不一致，保持保护')
+        }
+        return true
+      }
+      if (manifest && manifest.filterPatch) {
+        if (manifest.callId !== result.callId || result.validation !== 'PASSED' || result.persistenceStatus !== 'SAVED') throw new Error('RESULT_UNKNOWN: 筛选调用缺少可信保存结果')
+        const patch = manifest.filterPatch
+        if (this.loadedRevision === result.loadedRevision && this.draftVersion === result.draftVersion) {
+          if (JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint || !sameControlledFilterSnapshot(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 筛选保存后页面已变化，保持保护')
+          }
+          this.agentSyncRequired = false
+          return true
+        }
+        const executed = this.controlledExecution && this.controlledExecution.callId === result.callId ? this.controlledExecution : null
+        if (executed) {
+          if (!sameWorkspace(this, executed.identity) || !executed.fingerprint || executed.fingerprint !== JSON.stringify(this.getSnapshot()) || !sameControlledFilterSnapshot(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 筛选执行与服务器草稿不一致，保持保护')
+          }
+        } else {
+          if (manifest.loadedRevision !== this.loadedRevision || JSON.stringify(this.getSnapshot()) !== this.loadedSnapshotFingerprint || !sameControlledFilterTransition(this.getSnapshot(), state.snapshot, patch)) {
+            this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+            throw new Error('RESULT_UNKNOWN: 筛选恢复含目标外变化，保持保护')
+          }
+        }
+        const reloaded = await this.reloadAgentDraft(isCurrent, { skipPreserve: !!executed })
+        if (!isCurrent() || reloaded.loadedRevision !== result.loadedRevision || reloaded.draftVersion !== result.draftVersion || !sameControlledFilterSnapshot(this.getSnapshot(), reloaded.snapshot, patch)) {
+          this.agentSyncRequired = true; this.lockAgentWorkspace(true)
+          throw new Error('RESULT_UNKNOWN: 筛选重载与可信草稿不一致，保持保护')
+        }
+        return true
+      }
       if (manifest && manifest.patch) {
         if (manifest.callId !== result.callId || result.validation !== 'PASSED' || result.persistenceStatus !== 'SAVED') throw new Error('RESULT_UNKNOWN: 格式调用缺少可信保存结果')
         // A later poll can see the same committed call after the first authoritative reload.
@@ -532,10 +677,10 @@ export default {
       this.loadedRevision = draft.loadedRevision || draft.contentHash
       this.loadedSnapshotFingerprint = JSON.stringify(snapshot)
     },
-    preserveLocalDraft() {
+    preserveLocalDraft(force = false) {
       this.flushManualChanges(true)
       const snapshot = this.getSnapshot()
-      if (!snapshot || JSON.stringify(snapshot) === this.loadedSnapshotFingerprint) return
+      if (!snapshot || (force !== true && JSON.stringify(snapshot) === this.loadedSnapshotFingerprint)) return
       const draft = { workbookId: this.currentDocumentId, branchId: this.currentBranchId, loadedRevision: this.loadedRevision,
         expectedDraftVersion: this.draftVersion, snapshot, plannedActions: this.pendingActions, executedChanges: this.pendingChanges, savedAt: Date.now() }
       this.conflictDrafts.push(draft)
@@ -731,7 +876,10 @@ export default {
           if (showMsg) this.$modal.msgError('草稿保存失败：' + (e.message || String(e)))
         })
       }
+      const creationIdentity = this.workspaceIdentity(), creationFingerprint = JSON.stringify(this.getSnapshot())
+      let createdDocumentId = null
       return this.runPersistTask('正在保存表格…', updateProgress => {
+        if (!sameWorkspace(this, creationIdentity) || creationFingerprint !== JSON.stringify(this.getSnapshot()) || this.agentLocked || this.agentSyncRequired || this.historyPreview) throw new Error('首次保存前工作区已变化，未发送创建请求')
         updateProgress(12, '正在生成表格快照…')
         const snapshot = this.getSnapshot()
         if (!snapshot) throw new Error('获取表格快照失败')
@@ -748,9 +896,14 @@ export default {
           updateProgress(48 + Math.round(percent * 0.42), percent >= 100 ? '正在等待服务器完成保存…' : '正在上传表格数据…')
         }).then(res => {
           if (!res || res.code !== 200 || !res.data) throw new Error((res && res.msg) || '保存失败')
+          createdDocumentId = res.data.workbookId
           return res
         })
       }).then((res) => {
+        if (!sameWorkspace(this, creationIdentity) || creationFingerprint !== JSON.stringify(this.getSnapshot()) || this.agentLocked || this.agentSyncRequired || this.historyPreview) {
+          this.fetchDocuments()
+          throw new Error('新文档已创建（ID ' + createdDocumentId + '），页面已变化，未应用旧保存结果；请从文件列表核实')
+        }
         if (res && res.code === 200 && res.data) {
           this.currentDocumentId = res.data.workbookId
           this.currentDocumentName = res.data.name
@@ -765,7 +918,7 @@ export default {
         }
       }).catch((e) => {
         console.error('保存文档失败:', e)
-        if (showMsg) this.$modal.msgError('保存失败：' + (e && e.message ? e.message : String(e)))
+        if (showMsg || createdDocumentId || sameWorkspace(this, creationIdentity)) this.$modal.msgError('保存失败：' + (e && e.message ? e.message : String(e)))
       })
     },
 
@@ -783,6 +936,7 @@ export default {
 
     runPersistTask(title, executor) {
       if (this.persistBusy) return Promise.reject(new Error('已有保存或提交任务正在进行'))
+      this.cancelExcelImport()
       clearTimeout(this.autosaveTimer)
       this.autosaveTimer = null
       this.persistBusy = true
@@ -970,6 +1124,8 @@ export default {
 
     /** 上传前校验 */
     beforeUpload(file) {
+      if (!file || !file.name) return false
+      if (this.agentSyncRequired || this.persistBusy || this.historyPreview) { this.$modal.msgWarning('请先结束保存、预览或待核实状态再导入'); return false }
       if (this.agentLocked) { this.$modal.msgWarning('请先停止或完成智能体任务'); return false }
       const isExcel =
         file.name.endsWith('.xlsx') ||
@@ -988,89 +1144,134 @@ export default {
       return true
     },
 
-    /** 处理文件上传 */
-    handleFileChange(file) {
-      if (!file || !file.raw) return
-      if (!this.beforeUpload(file.raw)) return
+    cancelExcelImport() {
+      const pending = this.pendingExcelImport
+      this.pendingExcelImport = null
+      this.excelImportGeneration++
+      if (pending && pending.reader && pending.reader.readyState === 1) pending.reader.abort()
+    },
 
+    beginExcelImport(file) {
+      if (!this.beforeUpload(file)) return null
+      this.cancelExcelImport()
+      const context = { generation: this.excelImportGeneration, identity: this.workspaceIdentity(),
+        baseline: this.excelImportBaseline(), fingerprint: JSON.stringify(this.getSnapshot()), reader: null }
+      this.pendingExcelImport = context
       this.statusMessage = '正在解析 Excel 文件...'
-      this.importExcelWithXLSX(file.raw)
+      return context
     },
 
-    /** 使用 XLSX 库导入 Excel */
+    excelImportBaseline() {
+      return JSON.stringify([this.headCommitId, this.branchVersion, this.draftVersion, this.loadedRevision])
+    },
+
+    isExcelImportCurrent(context) {
+      return context && this.pendingExcelImport === context && context.generation === this.excelImportGeneration &&
+        sameWorkspace(this, context.identity) && !this.agentLocked && !this.agentSyncRequired && !this.persistBusy &&
+        !this.historyPreview && context.baseline === this.excelImportBaseline() &&
+        context.fingerprint === JSON.stringify(this.getSnapshot())
+    },
+
+    expireExcelImport(context) {
+      if (this.pendingExcelImport !== context) return
+      this.cancelExcelImport()
+      if (sameWorkspace(this, context.identity) && !this.agentLocked && !this.agentSyncRequired && !this.persistBusy && !this.historyPreview) {
+        this.statusMessage = '导入期间工作区已变化，当前内容已保留；请重新选择文件'
+        this.$modal.msgWarning(this.statusMessage)
+      }
+    },
+
+    failExcelImport(context, error) {
+      if (!this.isExcelImportCurrent(context)) { this.expireExcelImport(context); return }
+      this.cancelExcelImport()
+      this.statusMessage = '导入失败：' + (error.message || String(error))
+      this.$modal.msgError(this.statusMessage)
+    },
+
+    /** 每次选择只启动本地解析，不向 upload 的占位地址提交文件。 */
+    handleFileChange(file) {
+      if (file && file.raw) return this.importExcelWithXLSX(file.raw)
+    },
+
     importExcelWithXLSX(file) {
-      const self = this
-      const reader = new FileReader()
-      reader.onload = function(e) {
-        try {
-          const data = new Uint8Array(e.target.result)
-          const workbook = XLSX.read(data, { type: 'array' })
-          const univerData = self.convertXlsxWorkbookToUniverData(workbook, file.name)
-          self.loadUniverWorkbook(univerData)
-          self.currentDocumentId = null
-          self.currentDocumentName = self.uniqueName(univerData.name || file.name)
-          self.currentDocumentType = 'imported'
-          self.currentDocumentVersion = null
-          self.resetVersionState()
-          self.statusMessage = 'Excel 文件导入成功'
-          self.$modal.msgSuccess('导入成功')
-          // 大表先保证界面可操作，由用户确认后再做首次完整保存。
-          if (!self.largeDataMode) self.saveCurrentWorkbook(false)
-          else self.statusMessage = 'Excel 导入成功，已自动启用大数据模式；请点击“保存”完成首次保存'
-        } catch (error) {
-          console.error('XLSX 解析失败，尝试 LuckyExcel:', error)
-          self.statusMessage = 'XLSX 解析失败，尝试备用方案...'
-          self.importExcelWithLuckyExcel(file)
+      const context = this.beginExcelImport(file)
+      if (!context) return
+      try {
+        const reader = new FileReader()
+        context.reader = reader
+        reader.onload = e => {
+          if (!this.isExcelImportCurrent(context)) { this.expireExcelImport(context); return }
+          let snapshot
+          try {
+            const workbook = XLSX.read(new Uint8Array(e.target.result), { type: 'array' })
+            snapshot = this.convertXlsxWorkbookToUniverData(workbook, file.name)
+          } catch (error) {
+            if (!this.isExcelImportCurrent(context)) { this.expireExcelImport(context); return }
+            this.statusMessage = 'XLSX 解析失败，尝试备用方案...'
+            this.importExcelWithLuckyExcel(file, context)
+            return
+          }
+          this.completeExcelImport(snapshot, file, context, false)
         }
-      }
-      reader.onerror = function() {
-        self.statusMessage = '文件读取失败'
-        self.$modal.msgError('文件读取失败')
-      }
-      reader.readAsArrayBuffer(file)
+        reader.onerror = () => this.failExcelImport(context, new Error('文件读取失败'))
+        reader.onabort = () => this.failExcelImport(context, new Error('文件读取已取消'))
+        reader.readAsArrayBuffer(file)
+      } catch (error) { this.failExcelImport(context, error) }
+      return context
     },
 
-    /** 使用 LuckyExcel 备用导入方案 */
-    importExcelWithLuckyExcel(file) {
-      const self = this
+    importExcelWithLuckyExcel(file, existingContext) {
+      const context = existingContext || this.beginExcelImport(file)
+      if (!context) return
+      if (!this.isExcelImportCurrent(context)) { this.expireExcelImport(context); return }
+      context.reader = null
+      // A parser may call success/error more than once; only its first callback is eligible.
+      let received = false
       try {
-        LuckyExcel.transformExcelToLucky(
-          file,
-          function(exportJson) {
-            if (!exportJson || !exportJson.sheets || exportJson.sheets.length === 0) {
-              self.$modal.msgError('未能读取到 Excel 中的有效数据')
-              self.statusMessage = '导入失败：文件中没有有效数据'
-              return
-            }
-            try {
-              const univerData = self.convertLuckyJsonToUniver(exportJson, file.name)
-              self.loadUniverWorkbook(univerData)
-              self.currentDocumentId = null
-              self.currentDocumentName = self.uniqueName(univerData.name || file.name)
-              self.currentDocumentType = 'imported'
-              self.currentDocumentVersion = null
-              self.resetVersionState()
-              self.statusMessage = 'Excel 文件导入成功（备用方案）'
-              self.$modal.msgSuccess('导入成功')
-              if (!self.largeDataMode) self.saveCurrentWorkbook(false)
-              else self.statusMessage = 'Excel 导入成功，已自动启用大数据模式；请点击“保存”完成首次保存'
-            } catch (err) {
-              console.error('LuckyExcel 数据转换失败:', err)
-              self.statusMessage = '导入失败: ' + (err.message || String(err))
-              self.$modal.msgError('导入失败: ' + (err.message || String(err)))
-            }
-          },
-          function(error) {
-            console.error('LuckyExcel 解析失败:', error)
-            self.statusMessage = '导入失败: ' + (error.message || String(error))
-            self.$modal.msgError('导入失败: ' + (error.message || String(error)))
-          }
-        )
-      } catch (error) {
-        console.error('LuckyExcel 导入异常:', error)
-        this.statusMessage = '导入失败: ' + (error.message || String(error))
-        this.$modal.msgError('导入失败: ' + (error.message || String(error)))
+        LuckyExcel.transformExcelToLucky(file, result => {
+          if (received) return
+          received = true
+          if (!this.isExcelImportCurrent(context)) { this.expireExcelImport(context); return }
+          if (!result || !result.sheets || !result.sheets.length) return this.failExcelImport(context, new Error('文件中没有有效数据'))
+          let snapshot
+          try { snapshot = this.convertLuckyJsonToUniver(result, file.name) }
+          catch (error) { this.failExcelImport(context, error); return }
+          this.completeExcelImport(snapshot, file, context, true)
+        }, error => {
+          if (received) return
+          received = true
+          this.failExcelImport(context, error || new Error('备用解析失败'))
+        })
+      } catch (error) { if (!received) this.failExcelImport(context, error) }
+      return context
+    },
+
+    completeExcelImport(snapshot, file, context, fallback) {
+      if (!this.isExcelImportCurrent(context)) { this.expireExcelImport(context); return }
+      try {
+        // Do not enter loadUniverWorkbook's delayed engine-recreation path with stale import data.
+        if (!this.univer || !this.univerAPI) throw new Error('表格引擎尚未就绪，请稍后重新导入')
+        if (!snapshot || !snapshot.sheetOrder || !snapshot.sheetOrder.length) throw new Error('文件中没有有效工作表')
+        this.preserveLocalDraft(true)
+      } catch (error) { this.failExcelImport(context, error); return }
+      this.cancelExcelImport()
+      try { this.loadUniverWorkbook(snapshot) }
+      catch (error) {
+        this.agentSyncRequired = true
+        this.lockAgentWorkspace(true)
+        this.statusMessage = '导入载入失败，原页面副本已保留，请下载草稿并重新打开文档'
+        this.$modal.msgError(this.statusMessage)
+        return
       }
+      this.currentDocumentId = null
+      this.currentDocumentName = this.uniqueName(snapshot.name || file.name)
+      this.currentDocumentType = 'imported'
+      this.currentDocumentVersion = null
+      this.resetVersionState()
+      this.statusMessage = fallback ? 'Excel 文件导入成功（备用方案）' : 'Excel 文件导入成功'
+      this.$modal.msgSuccess('导入成功')
+      if (!this.largeDataMode) this.saveCurrentWorkbook(false)
+      else this.statusMessage = 'Excel 导入成功，已自动启用大数据模式；请点击“保存”完成首次保存'
     },
 
     /** 转换 LuckyExcel 数据为 Univer 数据格式 */
@@ -1099,8 +1300,8 @@ export default {
               const rawValue = v.v !== undefined ? v.v : ''
               cellData[r][c] = {
                 v: rawValue,
-                t: typeof rawValue === 'number' ? 1 : 2,
-                f: v.f || undefined
+                t: typeof rawValue === 'number' ? 2 : typeof rawValue === 'boolean' ? 3 : 1,
+                f: v.f ? (v.f.startsWith('=') ? v.f : '=' + v.f) : undefined
               }
             })
           } else if (Array.isArray(cellSource)) {
@@ -1112,8 +1313,8 @@ export default {
                 const rawValue = cell.v !== undefined ? cell.v : (cell.m || '')
                 cellData[r][c] = {
                   v: rawValue,
-                  t: typeof rawValue === 'number' ? 1 : 2,
-                  f: cell.f || undefined
+                  t: typeof rawValue === 'number' ? 2 : typeof rawValue === 'boolean' ? 3 : 1,
+                  f: cell.f ? (cell.f.startsWith('=') ? cell.f : '=' + cell.f) : undefined
                 }
               })
             })
@@ -1174,12 +1375,12 @@ export default {
           const r = pos.r
           const c = pos.c
           if (!cellData[r]) cellData[r] = {}
-          let t = 2
-          if (cell.t === 'n' || cell.t === 'b' || cell.t === 'd') t = 1
+          const t = cell.t === 'b' ? 3 : cell.t === 'n' || cell.t === 'd' ? 2 : 1
+          const errors = { 0: '#NULL!', 7: '#DIV/0!', 15: '#VALUE!', 23: '#REF!', 29: '#NAME?', 36: '#NUM!', 42: '#N/A', 43: '#GETTING_DATA' }
           cellData[r][c] = {
-            v: cell.v !== undefined ? cell.v : (cell.w || ''),
+            v: cell.t === 'e' ? (errors[cell.v] || cell.w || '#VALUE!') : cell.v !== undefined ? cell.v : (cell.w || ''),
             t: t,
-            f: cell.f || undefined
+            f: cell.f ? (cell.f.startsWith('=') ? cell.f : '=' + cell.f) : undefined
           }
           if (r > maxRow) maxRow = r
           if (c > maxCol) maxCol = c
@@ -1293,41 +1494,47 @@ export default {
         Number(stats.populatedCells || 0).toLocaleString() + ' 单元格'
     },
 
-    /** 导出 Excel */
+    captureExportSnapshot() {
+      if (this.persistBusy || this.agentApplying || this.aiExecutionInProgress || this.suspendChangeCapture || this.pendingExcelImport) throw new Error('请等待当前载入或写入完成后再导出')
+      if (!this.hasData || !this.univerAPI) throw new Error('没有可导出的数据')
+      const workbook = this.univerAPI.getActiveWorkbook()
+      if (!workbook || typeof workbook.save !== 'function') throw new Error('无法获取完整工作簿快照，已停止导出')
+      const snapshot = workbook.save()
+      if (!snapshot || !snapshot.sheets) throw new Error('完整快照不可用，已停止导出')
+      return JSON.parse(JSON.stringify(snapshot, (key, value) => {
+        if (typeof value === 'number' && !Number.isFinite(value)) throw new Error('快照含非有限数字，已停止导出')
+        return value
+      }))
+    },
+
+    exportFileName(snapshot, suffix) {
+      const name = String(this.currentDocumentName || snapshot.name || '表格导出').replace(/[\x00-\x1f<>:"/\\|?*]/g, '-').slice(0, 100)
+      return name + '_' + this.formatDate(new Date()) + suffix
+    },
+
     handleExport() {
-      if (!this.hasData || !this.univerAPI) {
-        this.$modal.msgWarning('没有可导出的数据')
-        return
-      }
-
       try {
-        this.statusMessage = '正在导出 Excel 文件...'
-        const workbook = this.univerAPI.getActiveWorkbook()
-        if (!workbook) {
-          this.$modal.msgError('获取工作簿失败')
-          return
-        }
-
-        const snapshot = this.getSnapshot()
-
-        if (!snapshot) {
-          this.$modal.msgError('获取工作簿数据失败')
-          return
-        }
-
-        const xlsxWb = this.convertUniverSnapshotToXlsx(snapshot)
-        const wbout = XLSX.write(xlsxWb, { bookType: 'xlsx', type: 'array' })
-        const blob = new Blob([wbout], {
-          type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        })
-        const fileName = (snapshot.name || '表格导出') + '_' + this.formatDate(new Date()) + '.xlsx'
-        saveAs(blob, fileName)
-        this.statusMessage = '导出成功：' + fileName
-        this.$modal.msgSuccess('导出成功')
+        const snapshot = this.captureExportSnapshot(), workbook = this.convertUniverSnapshotToXlsx(snapshot)
+        const data = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
+        const name = this.exportFileName(snapshot, '.xlsx')
+        saveAs(new Blob([data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), name)
+        this.statusMessage = '已导出 Excel 数据与公式：' + name + '；完整样式及配置可另存 JSON 备份'
+        this.$modal.msgSuccess('Excel 数据导出成功')
       } catch (error) {
-        console.error('导出失败:', error)
-        this.statusMessage = '导出失败: ' + (error.message || String(error))
-        this.$modal.msgError('导出失败: ' + (error.message || String(error)))
+        this.statusMessage = '导出失败：' + (error.message || String(error))
+        this.$modal.msgError(this.statusMessage)
+      }
+    },
+
+    handleSnapshotExport() {
+      try {
+        const snapshot = this.captureExportSnapshot(), name = this.exportFileName(snapshot, '.snapshot.json')
+        saveAs(new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json;charset=utf-8' }), name)
+        this.statusMessage = '已下载完整快照备份：' + name
+        this.$modal.msgSuccess('完整快照备份已下载')
+      } catch (error) {
+        this.statusMessage = '备份失败：' + (error.message || String(error))
+        this.$modal.msgError(this.statusMessage)
       }
     },
 
@@ -1395,97 +1602,8 @@ export default {
       }
     },
 
-    /** 将 Univer snapshot 转换为 XLSX workbook */
-    convertUniverSnapshotToXlsx(snapshot) {
-      const wb = XLSX.utils.book_new()
-      const sheetOrder = snapshot.sheetOrder || Object.keys(snapshot.sheets || {})
-
-      sheetOrder.forEach(sheetId => {
-        const sheet = snapshot.sheets[sheetId]
-        if (!sheet) return
-        const ws = this.convertUniverSheetToXlsx(sheet)
-        XLSX.utils.book_append_sheet(wb, ws, (sheet.name || 'Sheet').substring(0, 31))
-      })
-
-      return wb
-    },
-
-    /** 将 Univer 工作表转换为 XLSX 工作表 */
-    convertUniverSheetToXlsx(sheet) {
-      const aoa = []
-      const cellData = sheet.cellData || {}
-      const mergeData = sheet.mergeData || []
-      let maxRow = sheet.rowCount || 0
-      let maxCol = sheet.columnCount || 0
-
-      const rowKeys = Object.keys(cellData)
-        .map(k => Number(k))
-        .filter(n => !isNaN(n))
-
-      if (rowKeys.length > 0) {
-        const actualMaxRow = Math.max(...rowKeys)
-        rowKeys.forEach(r => {
-          const colKeys = Object.keys(cellData[r] || {})
-            .map(k => Number(k))
-            .filter(n => !isNaN(n))
-          if (colKeys.length > 0) {
-            maxCol = Math.max(maxCol, Math.max(...colKeys) + 1)
-          }
-        })
-        maxRow = Math.max(maxRow, actualMaxRow + 1)
-      }
-
-      const limitRow = Math.min(maxRow, 100000)
-      const limitCol = Math.min(maxCol, 100)
-
-      for (let r = 0; r < limitRow; r++) {
-        const row = []
-        for (let c = 0; c < limitCol; c++) {
-          if (cellData[r] && cellData[r][c] !== undefined) {
-            const cell = cellData[r][c]
-            const cellValue = cell.v
-            const xlsxCell = {}
-            if (cell.f) {
-              xlsxCell.f = cell.f
-              if (cellValue !== undefined && cellValue !== null && cellValue !== '') {
-                xlsxCell.v = cellValue
-              }
-            } else {
-              xlsxCell.v = cellValue
-            }
-            if (typeof cellValue === 'number') {
-              xlsxCell.t = 'n'
-            } else if (typeof cellValue === 'boolean') {
-              xlsxCell.t = 'b'
-            } else {
-              xlsxCell.t = 's'
-            }
-            row.push(xlsxCell)
-          } else {
-            row.push(null)
-          }
-        }
-        aoa.push(row)
-      }
-
-      const ws = XLSX.utils.aoa_to_sheet(aoa)
-
-      if (mergeData && mergeData.length > 0) {
-        ws['!merges'] = mergeData
-          .filter(m =>
-            m.startRow !== undefined &&
-            m.endRow !== undefined &&
-            m.startColumn !== undefined &&
-            m.endColumn !== undefined
-          )
-          .map(m => ({
-            s: { r: m.startRow, c: m.startColumn },
-            e: { r: m.endRow, c: m.endColumn }
-          }))
-      }
-
-      return ws
-    },
+    convertUniverSnapshotToXlsx(snapshot) { return exportWorkbook(snapshot) },
+    convertUniverSheetToXlsx(sheet) { return exportSheet(sheet) },
 
     /** 创建新的空白表格 */
     createNewSheet() {
@@ -1593,6 +1711,8 @@ export default {
     },
 
     resetVersionState() {
+      this.branchCheckoutUncertain = false;
+      this.cancelExcelImport()
       this.workspaceGeneration++
       this.loadedRevision = null
       this.loadedSnapshotFingerprint = null
@@ -1703,99 +1823,197 @@ export default {
       if (this.agentLocked) return this.$modal.msgWarning('请先停止或完成智能体任务')
       if (!this.currentDocumentId) return
       this.versionDialogVisible = true
-      Promise.all([this.loadVersionStatus(), listCommits(this.currentDocumentId).then(res => {
+      const identity = this.workspaceIdentity()
+      return Promise.all([this.loadVersionStatus(), listCommits(identity.workbookId).then(res => {
+        if (!sameWorkspace(this, identity)) return
         if (res && res.code === 200) this.commitHistory = res.data || []
-      }), this.loadBranches()]).catch(e => this.$modal.msgError('加载版本信息失败：' + (e.message || String(e))))
+      }), this.loadBranches()]).catch(e => { if (sameWorkspace(this, identity)) this.$modal.msgError('加载版本信息失败：' + (e.message || String(e))) })
     },
 
     loadBranches() {
       if (!this.currentDocumentId) return Promise.resolve()
-      return listBranches(this.currentDocumentId).then(res => {
+      const identity = this.workspaceIdentity()
+      return listBranches(identity.workbookId).then(res => {
+        if (!sameWorkspace(this, identity)) return
         if (!res || res.code !== 200) throw new Error((res && res.msg) || '加载分支失败')
         this.branches = res.data || []
       })
     },
 
     createDraftBranch() {
+      if (this.agentLocked || this.agentSyncRequired || this.persistBusy || this.historyPreview) return this.$modal.msgWarning('请先结束任务、保存或预览再创建分支')
+      const identity = this.workspaceIdentity()
       const name = (this.newBranchName || '').trim()
       if (!name) return this.$modal.msgWarning('请输入草稿分支名称')
-      createBranch(this.currentDocumentId, {
+      return createBranch(identity.workbookId, {
         branchName: name,
         fromCommitId: this.headCommitId,
         operationId: createOperationId()
       }).then(res => {
+        if (!sameWorkspace(this, identity)) return
         if (!res || res.code !== 200) throw new Error((res && res.msg) || '创建分支失败')
-        this.newBranchName = ''
+        if ((this.newBranchName || '').trim() === name) this.newBranchName = ''
         this.$modal.msgSuccess('草稿分支已创建')
         return this.loadBranches()
-      }).catch(e => this.$modal.msgError(e.message || String(e)))
+      }).catch(e => { if (sameWorkspace(this, identity)) this.$modal.msgError(e.message || String(e)) })
     },
 
     checkoutSelectedBranch(branchId) {
-      if (this.agentLocked) { this.selectedBranchId = this.currentBranchId; return this.$modal.msgWarning('任务期间不能切换分支') }
-      if (!branchId || branchId === this.currentBranchId) return
-      const previousBranchId = this.currentBranchId
-      const previousSelection = previousBranchId
       const identity = this.workspaceIdentity()
+      if (this.agentLocked || this.agentSyncRequired || this.persistBusy || this.historyPreview) {
+        this.selectedBranchId = this.currentBranchId
+        return this.$modal.msgWarning('请先结束任务、保存、预览或核实状态再切换分支')
+      }
+      if (!branchId || String(branchId) === String(this.currentBranchId)) return
+      const target = this.branches.find(item => String(item.branchId) === String(branchId))
+      if (!target || !Number.isInteger(target.version) || !Number.isInteger(target.draftVersion) || !target.loadedRevision || !Number.isInteger(this.currentDocumentVersion)) {
+        this.selectedBranchId = this.currentBranchId
+        return this.$modal.msgWarning('请刷新并核实源、目标分支信息后再切换')
+      }
       this.flushManualChanges(true)
-      this.autosaveWorkingState(true).then(() => checkoutBranch(this.currentDocumentId, branchId, {
-        operationId: createOperationId(),
-        currentBranchId: previousBranchId,
-        baseCommitId: this.headCommitId
-      })).then(res => {
-        if (!sameWorkspace(this, identity)) throw new Error('分支切换响应已过期')
-        if (!res || res.code !== 200 || !res.data || !res.data.content) throw new Error((res && res.msg) || '切换分支失败')
-        this.preserveLocalDraft()
+      const fingerprint = JSON.stringify(this.getSnapshot()), targetBinding = { targetVersion: target.version,
+        targetHeadCommitId: target.headCommitId, expectedTargetDraftVersion: target.draftVersion, targetLoadedRevision: target.loadedRevision }
+      let source
+      try { source = versionMutationBinding(this) } catch (e) { this.selectedBranchId = this.currentBranchId; return this.$modal.msgError(e.message) }
+      const workbookVersion = this.currentDocumentVersion
+      let sent = false
+      const verify = () => {
+        if (!sameWorkspace(this, identity) || this.agentLocked || this.agentSyncRequired || this.historyPreview || fingerprint !== JSON.stringify(this.getSnapshot())) throw new Error('切换期间工作区或编辑已变化，未覆盖页面')
+      }
+      return this.runPersistTask('正在切换分支…', async () => {
+        verify()
+        if (JSON.stringify(source) !== JSON.stringify(versionMutationBinding(this)) || workbookVersion !== this.currentDocumentVersion) throw new Error('源版本已变化，未发送切换请求')
+        this.preserveLocalDraft(true)
+        if (this.pendingChanges.length) {
+          const snapshot = this.getSnapshot(), saved = await saveWorkingState(identity.workbookId, workingStatePayload(this, snapshot))
+          if (!saved || saved.code !== 200 || !saved.data) throw new Error((saved && saved.msg) || '源分支草稿保存失败')
+          if (!sameWorkspace(this, identity)) throw new Error('源草稿保存响应属于旧工作区')
+          this.adoptSavedDraft(saved.data, snapshot)
+        }
+        verify()
+        sent = true
+        const loaded = versionMutationBinding(this)
+        const res = await checkoutBranch(identity.workbookId, branchId, { ...targetBinding, operationId: createOperationId(),
+          currentBranchId: loaded.branchId, baseCommitId: loaded.baseCommitId, baseVersion: loaded.baseVersion,
+          expectedDraftVersion: loaded.expectedDraftVersion, loadedRevision: loaded.loadedRevision, expectedWorkbookVersion: workbookVersion })
+        if (res && res.code !== 200) throw new Error(res.msg || '分支切换被拒绝')
+        if (!res || !res.data || !res.data.content || !res.data.loadedRevision || String(res.data.branchId) !== String(branchId) || !Number.isInteger(res.data.version) || !Number.isInteger(res.data.workbookVersion) || (res.data.workingState && !Number.isInteger(res.data.workingState.version))) throw new Error('分支切换响应不完整，请核实服务器')
+        verify()
+        if (!this.univer || !this.univerAPI) throw new Error('表格引擎尚未就绪，请核实服务器分支')
         this.loadUniverWorkbook(JSON.parse(res.data.content))
-        this.currentBranchId = res.data.branchId
-        this.currentBranchName = res.data.branchName
-        this.selectedBranchId = res.data.branchId
-        this.branchVersion = res.data.version
-        this.headCommitId = res.data.headCommitId
-        this.currentDocumentVersion = res.data.workbookVersion
-        const draft = res.data.workingState
-        this.draftVersion = draft ? draft.version : -1
-        this.loadedRevision = res.data.contentHash
+        this.applyVersionStatus(res.data, true)
         this.loadedSnapshotFingerprint = JSON.stringify(this.getSnapshot())
         this.workspaceGeneration++
-        this.pendingChanges = draft && draft.executedChangesJson ? JSON.parse(draft.executedChangesJson) : []
-        this.pendingActions = draft && draft.draftActionsJson ? JSON.parse(draft.draftActionsJson) : []
         this.statusMessage = '已切换到分支：' + res.data.branchName
+        const switchedIdentity = this.workspaceIdentity()
+        try { await this.loadBranches() } catch (e) { if (sameWorkspace(this, switchedIdentity)) this.$modal.msgWarning('切换成功，分支列表刷新失败，请刷新版本管理后再切换') }
+        return res
       }).catch(e => {
-        this.selectedBranchId = previousSelection
+        if (!sameWorkspace(this, identity)) return
+        this.selectedBranchId = this.currentBranchId
+        if (sent) {
+          this.branchCheckoutUncertain = true
+          this.agentSyncRequired = true
+          this.lockAgentWorkspace(true)
+          try { this.preserveLocalDraft(true) } catch (backupError) { this.$modal.msgError(backupError.message) }
+        }
         this.$modal.msgError('切换失败：' + (e.message || String(e)))
       })
     },
 
-    fastForwardCurrentBranch() {
-      this.flushManualChanges()
-      if (this.pendingChanges.length) return this.$modal.msgWarning('草稿分支还有未提交变化，请先提交')
-      const main = this.branches.find(item => item.branchName === 'main')
-      if (!main) return this.$modal.msgError('未找到 main 分支')
-      this.$confirm('仅当 main 自草稿分支创建后没有分叉时才会执行；否则系统会停止并要求人工处理冲突。是否继续？', '安全纳入 main', {
-        confirmButtonText: '继续', cancelButtonText: '取消', type: 'warning'
-      }).then(() => fastForwardBranchToMain(this.currentDocumentId, this.currentBranchId, {
-        operationId: createOperationId(),
-        mainHeadCommitId: main.headCommitId,
-        mainVersion: main.version
-      })).then(res => {
-        if (!res || res.code !== 200 || !res.data) throw new Error((res && res.msg) || '纳入 main 失败')
-        this.historyPreview = false
-        this.loadUniverWorkbook(JSON.parse(res.data.content))
-        this.currentBranchId = res.data.branchId
-        this.currentBranchName = 'main'
-        this.selectedBranchId = res.data.branchId
-        this.branchVersion = res.data.version
-        this.headCommitId = res.data.headCommitId
-        this.currentDocumentVersion = res.data.workbookVersion
-        this.$modal.msgSuccess('草稿提交已安全纳入 main')
-        this.draftVersion = -1
-        this.loadedRevision = res.data.contentHash
+    reconcileBranchCheckout() {
+      if (!this.branchCheckoutUncertain || this.persistBusy) return
+      const identity = this.workspaceIdentity(), fingerprint = JSON.stringify(this.getSnapshot())
+      const verify = () => {
+        if (!sameWorkspace(this, identity) || fingerprint !== JSON.stringify(this.getSnapshot())) throw new Error('核实期间工作区或编辑已变化，已保持原页面')
+      }
+      const checkRun = async () => {
+        const run = await activeAgent(identity.workbookId)
+        if (!run || typeof run !== 'object' || Array.isArray(run)) throw new Error('无法核实任务状态，保持保护')
+        if (run.runId && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(run.status)) throw new Error('请先停止或完成当前任务，再核实分支')
+      }
+      return this.runPersistTask('正在核实服务器分支…', async () => {
+        this.preserveLocalDraft(true)
+        await checkRun()
+        const response = await getVersionStatus(identity.workbookId)
+        verify()
+        const state = response && response.code === 200 && response.data
+        if (!state || String(state.workbookId) !== String(identity.workbookId) || !state.branchId || !state.content || !state.loadedRevision || !Number.isInteger(state.version) || !Number.isInteger(state.workbookVersion) || (state.workingState && !Number.isInteger(state.workingState.version))) throw new Error('服务器分支信息不完整，保持保护')
+        await checkRun()
+        verify()
+        if (!this.univer || !this.univerAPI) throw new Error('表格引擎尚未就绪，保持保护')
+        this.loadUniverWorkbook(JSON.parse(state.content))
+        this.applyVersionStatus(state, true)
         this.loadedSnapshotFingerprint = JSON.stringify(this.getSnapshot())
-        this.pendingChanges = []; this.pendingActions = []
         this.workspaceGeneration++
-        return this.openVersionDialog()
-      }).catch(e => {
+        this.branchCheckoutUncertain = false
+        this.agentSyncRequired = false
+        this.lockAgentWorkspace(false)
+        this.statusMessage = '已核实服务器当前分支：' + state.branchName
+        const reconciledIdentity = this.workspaceIdentity()
+        try { await this.loadBranches() } catch (e) { if (sameWorkspace(this, reconciledIdentity)) this.$modal.msgWarning('核实成功，分支列表刷新失败，请刷新版本管理') }
+        return state
+      }).catch(e => { if (sameWorkspace(this, identity)) this.$modal.msgError('核实失败：' + (e.message || String(e))) })
+    },
+
+    discardCurrentDraft() {
+      if (this.agentLocked || this.persistBusy || this.historyPreview) return this.$modal.msgWarning('请先结束当前任务或预览，再核实草稿')
+      let binding
+      try { binding = versionMutationBinding(this) } catch (e) { return this.$modal.msgError(e.message) }
+      if (binding.expectedDraftVersion < 0) return this.$modal.msgWarning('当前页面没有已加载的服务器草稿')
+      const identity = this.workspaceIdentity(), fingerprint = JSON.stringify(this.getSnapshot())
+      return this.$confirm('将丢弃当前分支中本页面已加载的服务器草稿，正式历史保留。页面副本会先保留到可下载草稿，再载入服务器当前内容。是否继续？', '丢弃已保存草稿', {
+        confirmButtonText: '确认丢弃', cancelButtonText: '取消', type: 'warning'
+      }).then(() => {
+        if (!sameWorkspace(this, identity) || this.agentLocked || fingerprint !== JSON.stringify(this.getSnapshot()) || JSON.stringify(binding) !== JSON.stringify(versionMutationBinding(this))) throw new Error('确认期间工作区已变化，未发送丢弃请求，请重新核实')
+        return this.runPersistTask('正在丢弃已核实草稿…', async () => {
+          this.preserveLocalDraft(true)
+          const res = await discardWorkingState(identity.workbookId, { ...binding, confirmed: true })
+          if (!res || res.code !== 200) throw new Error((res && res.msg) || '丢弃失败，本地副本已保留')
+          if (!sameWorkspace(this, identity)) throw new Error('丢弃结果属于旧工作区，请核实服务器状态')
+          const state = await getVersionStatus(identity.workbookId)
+          if (!sameWorkspace(this, identity)) throw new Error('工作区已切换，忽略旧核实响应')
+          if (!state || state.code !== 200 || !state.data || String(state.data.branchId) !== String(identity.branchId)) throw new Error('服务器分支已变化，请重新载入并核实')
+          if (fingerprint !== JSON.stringify(this.getSnapshot())) { this.preserveLocalDraft(true); throw new Error('等待期间有新编辑，已保留，本次不覆盖页面') }
+          this.loadUniverWorkbook(JSON.parse(state.data.content))
+          this.applyVersionStatus(state.data, true)
+          this.loadedSnapshotFingerprint = JSON.stringify(this.getSnapshot())
+          this.workspaceGeneration++
+          return state
+        })
+      }).then(() => { this.$modal.msgSuccess('已丢弃指定草稿，页面副本已保留'); return this.openVersionDialog() }).catch(e => {
+        if (e !== 'cancel' && e !== 'close') this.$modal.msgError(e.message || String(e))
+      })
+    },
+
+    fastForwardCurrentBranch() {
+      if (this.agentLocked || this.persistBusy || this.historyPreview) return this.$modal.msgWarning('请先结束任务或预览，再核实分支')
+      this.flushManualChanges(true)
+      if (this.pendingChanges.length) return this.$modal.msgWarning('源分支还有未提交变化，请先提交')
+      const main = this.branches.find(item => item.branchName === 'main')
+      if (!main || !Number.isInteger(main.draftVersion) || !main.loadedRevision) return this.$modal.msgWarning('请刷新并核实 main 分支信息后再合入')
+      let source
+      try { source = versionMutationBinding(this) } catch (e) { return this.$modal.msgError(e.message) }
+      const identity = this.workspaceIdentity(), fingerprint = JSON.stringify(this.getSnapshot())
+      const request = { operationId: createOperationId(), sourceHeadCommitId: source.baseCommitId, sourceVersion: source.baseVersion,
+        mainHeadCommitId: main.headCommitId, mainVersion: main.version, expectedMainDraftVersion: main.draftVersion, mainLoadedRevision: main.loadedRevision }
+      return this.$confirm('仅当 main 未分叉、源分支无未提交草稿且目标 main 无未提交变化时才会合入。任何版本变化都会停止。是否继续？', '安全纳入 main', {
+        confirmButtonText: '继续', cancelButtonText: '取消', type: 'warning'
+      }).then(() => {
+        if (!sameWorkspace(this, identity) || this.agentLocked || fingerprint !== JSON.stringify(this.getSnapshot()) || JSON.stringify(source) !== JSON.stringify(versionMutationBinding(this))) throw new Error('确认期间工作区已变化，未发送合入请求')
+        return this.runPersistTask('正在安全纳入 main…', async () => {
+          const res = await fastForwardBranchToMain(identity.workbookId, identity.branchId, request)
+          if (!res || res.code !== 200 || !res.data) throw new Error((res && res.msg) || '合入失败')
+          if (!sameWorkspace(this, identity)) throw new Error('合入响应属于旧工作区，未覆盖当前页面')
+          if (fingerprint !== JSON.stringify(this.getSnapshot())) { this.preserveLocalDraft(true); throw new Error('等待期间有新编辑，已保留，请重新核实服务器') }
+          this.historyPreview = false
+          this.loadUniverWorkbook(JSON.parse(res.data.content))
+          this.applyVersionStatus({ ...res.data, loadedRevision: res.data.loadedRevision || res.data.contentHash, workingState: null }, true)
+          this.loadedSnapshotFingerprint = JSON.stringify(this.getSnapshot())
+          this.workspaceGeneration++
+          return res
+        })
+      }).then(() => { this.$modal.msgSuccess('源提交已安全纳入 main'); return this.openVersionDialog() }).catch(e => {
         if (e !== 'cancel' && e !== 'close') this.$modal.msgError(e.message || String(e))
       })
     },
@@ -1819,11 +2037,9 @@ export default {
         const submittedChanges = this.pendingChanges.length
         const submittedActions = this.pendingActions.length
         const payload = {
-          branchId: this.currentBranchId,
+          ...versionMutationBinding(this),
           commitMessage: message,
           operationId: createOperationId(),
-          baseCommitId: this.headCommitId,
-          baseVersion: this.branchVersion,
           content: JSON.stringify(snapshot),
           source: this.pendingChanges.some(item => item.source === 'ai') && this.pendingChanges.some(item => item.source === 'manual')
             ? 'mixed' : (this.pendingChanges.some(item => item.source === 'ai') ? 'ai' : 'manual'),
@@ -1890,10 +2106,8 @@ export default {
       }).then(() => {
         if (!sameWorkspace(this, identity)) throw new Error('工作簿已切换，取消恢复')
         return restoreVersion(identity.workbookId, row.commitId, {
-          branchId: this.currentBranchId,
+          ...versionMutationBinding(this),
           operationId: createOperationId(),
-          baseCommitId: this.headCommitId,
-          baseVersion: this.branchVersion,
           commitMessage: '恢复到版本 #' + row.commitNo,
           actionSchemaVersion: '2.0'
         })

@@ -106,34 +106,7 @@
               <span class="exec-range" v-if="r.range">{{ r.range }}</span>
               <span class="exec-error" v-if="!r.ok">：{{ r.error }}</span>
               <span class="exec-note" v-if="r.note">（{{ r.note }}）</span>
-              <!-- 图表结果 -->
-              <div
-                v-if="r.result && r.result.chartOption"
-                class="exec-chart"
-              >
-                <chart-card :option="r.result.chartOption" height="280px" />
-              </div>
-              <!-- 读取类结果表格 -->
-              <table
-                v-else-if="r.result && r.result.values && Array.isArray(r.result.values)"
-                class="exec-table"
-              >
-                <tr v-for="(row, rri) in r.result.values.slice(0, 8)" :key="rri">
-                  <td v-for="(cell, cci) in row" :key="cci">{{ cell === null || cell === undefined ? '' : cell }}</td>
-                </tr>
-              </table>
-              <div
-                v-else-if="r.result && r.result.selection"
-                class="exec-result-text"
-              >
-                当前选区：{{ r.result.selection.a1 || '(无)' }}
-              </div>
-              <div
-                v-else-if="r.result && r.result.merges"
-                class="exec-result-text"
-              >
-                合并区域 {{ r.result.merges.length }} 个：{{ r.result.merges.map(m=>m.a1||'?').join(', ') }}
-              </div>
+              <read-display-result v-if="r.result" :result="r.result" />
             </div>
           </div>
         </div>
@@ -188,7 +161,7 @@ import { collectContext } from '../univer-context'
 import { executeActions } from '../univer-action-executor'
 import { createOperationId } from '../change-capture'
 import { classifyAiActions } from '../controlled-write-executor'
-import ChartCard from './ChartCard.vue'
+import ReadDisplayResult from './ReadDisplayResult.vue'
 import AgentTaskPanel from './AgentTaskPanel.vue'
 
 const QUICK_COMMANDS = [
@@ -205,7 +178,7 @@ const STORAGE_CONVERSATION = 'aiPanel.conversationId'
 
 export default {
   name: 'AiChatPanel',
-  components: { ChartCard, AgentTaskPanel },
+  components: { ReadDisplayResult, AgentTaskPanel },
   props: {
     univerAPI: { type: Object, default: null },
     workbook: { type: Object, default: null },
@@ -232,7 +205,7 @@ export default {
       execProgress: '',
       dragging: false,
       dragStart: null,
-      lastSource: 'mock-fallback',
+      lastSource: null,
       quickCommands: QUICK_COMMANDS
     }
   },
@@ -400,6 +373,7 @@ export default {
     async send() {
       const userText = (this.input || '').trim()
       if (!userText || this.loading || !this.workbook || this.readOnly || this.agentLocked) return
+      this.lastSource = null
       if (this.agentMode) {
         this.input = ''
         this.messages.push({ role: 'user', content: userText })

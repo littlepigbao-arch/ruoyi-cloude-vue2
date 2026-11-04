@@ -133,6 +133,163 @@ export function sameControlledFormatTransition(before, after, patch) {
 }
 export const CONTROLLED_VALUE_ACTIONS = ['setCell', 'setValues', 'setCellForCell', 'clearRange']
 export const CONTROLLED_FORMAT_ACTIONS = ['setStyle', 'setRowHeight', 'setColumnWidth']
+export const CONTROLLED_FILTER_ACTIONS = ['setFilter', 'clearFilter']
+export const CONTROLLED_FORMULA_ACTIONS = ['setFormula', 'sumToCell']
+export function normalizeControlledFormulaAction(raw) {
+  if (raw && raw.type === 'setFormula') return raw
+  const allowed = ['schemaVersion', 'type', 'target', 'sourceRange', 'targetRange']
+  if (!raw || raw.schemaVersion !== '2.0' || raw.type !== 'sumToCell' || Object.keys(raw).some(k => !allowed.includes(k)) ||
+      !raw.target || Object.keys(raw.target).some(k => !['sheetId', 'range'].includes(k)) || typeof raw.target.sheetId !== 'string' || !raw.target.sheetId) throw new Error('B10 sumToCell 清单无效')
+  const range = Object.prototype.hasOwnProperty.call(raw.target, 'range') ? raw.target.range : raw.targetRange
+  const pattern = /^[A-Z]{1,3}[1-9][0-9]*(?::[A-Z]{1,3}[1-9][0-9]*)?$/
+  if (typeof range !== 'string' || !pattern.test(range) || typeof raw.sourceRange !== 'string' || !pattern.test(raw.sourceRange) ||
+      (raw.targetRange !== undefined && raw.targetRange !== range)) throw new Error('B10 sumToCell 来源或目标无效')
+  const target = parseA1(range), source = parseA1(raw.sourceRange)
+  const sourceParts = raw.sourceRange.split(':'), first = parseA1(sourceParts[0]), last = parseA1(sourceParts[1] || sourceParts[0])
+  if (!first || !last || first.startRow > last.startRow || first.startColumn > last.startColumn) throw new Error('B10 sumToCell 来源范围次序无效')
+  if (!target || !source || target.startRow !== target.endRow || target.startColumn !== target.endColumn ||
+      source.endRow < source.startRow || source.endColumn < source.startColumn || source.endRow >= 1000000 || source.endColumn >= 16384 ||
+      (source.endRow - source.startRow + 1) * (source.endColumn - source.startColumn + 1) > 1000) throw new Error('B10 sumToCell 范围无效或超限')
+  if (target.startRow >= source.startRow && target.startRow <= source.endRow && target.startColumn >= source.startColumn && target.startColumn <= source.endColumn) throw new Error('B10 sumToCell 来源不能包含目标')
+  const sourceRange = raw.sourceRange.includes(':') ? raw.sourceRange : raw.sourceRange + ':' + raw.sourceRange
+  return { schemaVersion: '2.0', type: 'setFormula', target: { sheetId: raw.target.sheetId, range }, formula: '=SUM(' + sourceRange + ')' }
+}
+export const CONTROLLED_MERGE_ACTIONS = ['merge', 'breakApart']
+export const CONTROLLED_STRUCTURE_ACTIONS = ['insertRows', 'deleteRows', 'insertColumns', 'deleteColumns']
+export const CONTROLLED_SHEET_ACTIONS = ['createSheet', 'renameSheet', 'copySheet', 'deleteSheet']
+function normalizedStructureSnapshot(snapshot) {
+  const copy = normalizedFormatSnapshot(snapshot)
+  if (!copy) return null
+  for (const sheet of Object.values(copy.sheets || {})) {
+    if (sheet.cellData) for (const [row, cells] of Object.entries(sheet.cellData)) if (!Object.keys(cells).length) delete sheet.cellData[row]
+    for (const key of ['cellData', 'rowData', 'columnData']) if (sheet[key] && !Object.keys(sheet[key]).length) delete sheet[key]
+    if (Array.isArray(sheet.mergeData) && !sheet.mergeData.length) delete sheet.mergeData
+  }
+  return copy
+}
+function sameStructureSheet(actual, expected) {
+  if (!actual || !expected || typeof actual !== 'object' || typeof expected !== 'object') return false
+  const left = normalizedStructureSnapshot({ sheets: { s: actual } }), right = normalizedStructureSnapshot({ sheets: { s: expected } })
+  return !!left && !!right && stable(left) === stable(right)
+}
+export function sameControlledStructureSnapshot(local, server, patch) {
+  if (patch?.beforeWorkbook) {
+    const expected = normalizedStructureSnapshot(patch.afterWorkbook), left = normalizedStructureSnapshot(local), right = normalizedStructureSnapshot(server)
+    // The installed SDK retains the initial activeSheet metadata after deleting it.
+    if (patch.type === 'deleteSheet') for (const snapshot of [left, right]) {
+      if (snapshot?.activeSheet === patch.sheetId && !snapshot.sheets?.[patch.sheetId] && snapshot.sheets?.[patch.fallbackSheetId]) snapshot.activeSheet = patch.fallbackSheetId
+    }
+    return !!expected && !!left && !!right && stable(left) === stable(expected) && stable(right) === stable(expected)
+  }
+  if (!patch || !patch.sheetId || !patch.afterSheet || !sameStructureSheet(local?.sheets?.[patch.sheetId], patch.afterSheet) || !sameStructureSheet(server?.sheets?.[patch.sheetId], patch.afterSheet)) return false
+  const left = normalizedStructureSnapshot(local), right = normalizedStructureSnapshot(server)
+  return !!left && !!right && stable(left) === stable(right)
+}
+export function sameControlledStructureTransition(before, after, patch) {
+  if (patch?.beforeWorkbook) {
+    const baseline = normalizedStructureSnapshot(patch.beforeWorkbook), actualBefore = normalizedStructureSnapshot(before)
+    return !!baseline && !!actualBefore && stable(baseline) === stable(actualBefore) && sameControlledStructureSnapshot(patch.afterWorkbook, after, patch)
+  }
+  if (!patch || !patch.sheetId || !patch.beforeSheet || !patch.afterSheet || !sameStructureSheet(before?.sheets?.[patch.sheetId], patch.beforeSheet)) return false
+  const expected = plain(before)
+  expected.sheets[patch.sheetId] = plain(patch.afterSheet)
+  return sameControlledStructureSnapshot(expected, after, patch)
+}
+const mergeGeometry = merge => ({ startRow: merge.startRow, startColumn: merge.startColumn, endRow: merge.endRow, endColumn: merge.endColumn })
+function mergeGeometries(snapshot, sheetId) {
+  const list = snapshot?.sheets?.[sheetId]?.mergeData || []
+  if (!Array.isArray(list)) throw new Error('B8b 合并资源无效')
+  return list.map(mergeGeometry)
+}
+function normalizedMergeSnapshot(snapshot) {
+  const copy = normalizedFormatSnapshot(snapshot)
+  if (!copy) return null
+  for (const sheet of Object.values(copy.sheets || {})) sheet.mergeData = (sheet.mergeData || []).map(mergeGeometry)
+  return copy
+}
+export function sameControlledMergeSnapshot(local, server, patch) {
+  try {
+    if (!patch || !patch.sheetId || !Array.isArray(patch.afterMerges) || !Array.isArray(patch.removedCells)) return false
+    const expected = patch.afterMerges.map(mergeGeometry)
+    if (stable(mergeGeometries(local, patch.sheetId)) !== stable(expected) || stable(mergeGeometries(server, patch.sheetId)) !== stable(expected)) return false
+    const left = normalizedMergeSnapshot(local), right = normalizedMergeSnapshot(server)
+    return !!left && !!right && stable(left) === stable(right)
+  } catch (_) { return false }
+}
+export function sameControlledMergeTransition(before, after, patch) {
+  try {
+    if (!patch || !patch.sheetId || !Array.isArray(patch.beforeMerges) || !Array.isArray(patch.afterMerges) || !Array.isArray(patch.removedCells)) return false
+    if (stable(mergeGeometries(before, patch.sheetId)) !== stable(patch.beforeMerges.map(mergeGeometry))) return false
+    const expected = plain(before), sheet = expected.sheets?.[patch.sheetId]
+    if (!sheet) return false
+    sheet.mergeData = plain(patch.afterMerges)
+    for (const cell of patch.removedCells) {
+      const row = sheet.cellData?.[cell.row]
+      if (!row || stable(row[cell.column]) !== stable(cell.before)) return false
+      delete row[cell.column]
+      if (!Object.keys(row).length) delete sheet.cellData[cell.row]
+    }
+    return sameControlledMergeSnapshot(expected, after, patch)
+  } catch (_) { return false }
+}
+export function sameControlledFormulaSnapshot(local, server, patch) {
+  if (!patch || typeof patch.sheetId !== 'string' || !Array.isArray(patch.cells) || !patch.cells.length) return false
+  const left = normalizedFormatSnapshot(local), right = normalizedFormatSnapshot(server)
+  if (!left || !right) return false
+  for (const cell of patch.cells) {
+    if (!Number.isInteger(cell.row) || !Number.isInteger(cell.column) || typeof cell.formula !== 'string' || !Number.isSafeInteger(cell.value)) return false
+    for (const snapshot of [left, right]) {
+      const actual = snapshot.sheets?.[patch.sheetId]?.cellData?.[cell.row]?.[cell.column]
+      if (actual?.f !== cell.formula || actual?.v !== cell.value || actual?.t !== 2) return false
+    }
+  }
+  return stable(left) === stable(right)
+}
+export function sameControlledFormulaTransition(before, after, patch) {
+  try {
+    const expected = plain(before), sheet = expected.sheets?.[patch.sheetId]
+    if (!sheet || !Array.isArray(patch.cells) || !patch.cells.length) return false
+    if (!sheet.cellData) sheet.cellData = {}
+    for (const cell of patch.cells) {
+      const prior = sheet.cellData?.[cell.row]?.[cell.column]
+      if (prior && Object.keys(prior).length) return false
+      if (!sheet.cellData[cell.row]) sheet.cellData[cell.row] = {}
+      sheet.cellData[cell.row][cell.column] = { f: cell.formula, v: cell.value, t: 2 }
+    }
+    return sameControlledFormulaSnapshot(expected, after, patch)
+  } catch (_) { return false }
+}
+function filterData(snapshot) {
+  const entries = (snapshot.resources || []).filter(resource => resource?.name === 'SHEET_FILTER_PLUGIN')
+  if (entries.length > 1 || (entries.length && typeof entries[0].data !== 'string')) throw new Error('B6 筛选资源重复或无效')
+  const parsed = entries.length ? JSON.parse(entries[0].data) : {}
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('B6 筛选资源结构无效')
+  return parsed
+}
+function normalizedFilterSnapshot(snapshot) {
+  const copy = normalizedFormatSnapshot(snapshot)
+  if (!copy) return null
+  for (const resource of copy.resources || []) if (resource.name === 'SHEET_FILTER_PLUGIN') resource.data = stable(JSON.parse(resource.data))
+  return copy
+}
+export function sameControlledFilterSnapshot(local, server, patch) {
+  try {
+    if (!patch || !patch.sheetId || stable(filterData(local)) !== stable(JSON.parse(patch.resourceData)) || stable(filterData(server)) !== stable(JSON.parse(patch.resourceData))) return false
+    const left = normalizedFilterSnapshot(local), right = normalizedFilterSnapshot(server)
+    return !!left && !!right && stable(left) === stable(right)
+  } catch (_) { return false }
+}
+export function sameControlledFilterTransition(before, after, patch) {
+  try {
+    if (!patch || !patch.sheetId || stable(filterData(before)) !== stable(patch.beforeData ? JSON.parse(patch.beforeData) : {})) return false
+    const expected = plain(before)
+    if (!Array.isArray(expected.resources)) expected.resources = []
+    const existing = expected.resources.find(resource => resource.name === 'SHEET_FILTER_PLUGIN')
+    if (existing) existing.data = patch.resourceData
+    else expected.resources.push({ name: 'SHEET_FILTER_PLUGIN', data: patch.resourceData })
+    return sameControlledFilterSnapshot(expected, after, patch)
+  } catch (_) { return false }
+}
 export const READ_DISPLAY_ACTIONS = ['getRangeValue', 'getRangeFormulas', 'getMerges', 'getSelection', 'getFilter', 'createChart']
 export function classifyAiActions(actions, controlledActions = []) {
   if (!Array.isArray(actions) || actions.length > 30) throw new Error('AI_CAPABILITY_BLOCKED: 动作组无效或超过30项')
@@ -140,6 +297,32 @@ export function classifyAiActions(actions, controlledActions = []) {
     const action = actions[0], target = action.target
     if (action.schemaVersion !== '2.0' || !target || typeof target.sheetId !== 'string' || !target.sheetId.trim() ||
       (action.type === 'setStyle' ? typeof target.range !== 'string' || !target.range.trim() : Object.prototype.hasOwnProperty.call(target, 'range'))) throw new Error('AI_CAPABILITY_BLOCKED: B5 格式目标无效')
+    return 'controlled-values'
+  }
+  if (actions.length === 1 && actions[0] && CONTROLLED_FILTER_ACTIONS.includes(actions[0].type) && Array.isArray(controlledActions) && controlledActions.includes(actions[0].type)) {
+    const action = actions[0], target = action.target
+    if (action.schemaVersion !== '2.0' || !target || typeof target.sheetId !== 'string' || !target.sheetId.trim() || typeof target.range !== 'string' || !parseA1(target.range)) throw new Error('AI_CAPABILITY_BLOCKED: B6 筛选目标无效')
+    return 'controlled-values'
+  }
+  if (actions.length === 1 && actions[0] && CONTROLLED_FORMULA_ACTIONS.includes(actions[0].type) && Array.isArray(controlledActions) && controlledActions.includes(actions[0].type)) {
+    const action = normalizeControlledFormulaAction(actions[0]), target = action.target
+    if (action.schemaVersion !== '2.0' || !target || typeof target.sheetId !== 'string' || !target.sheetId.trim() || typeof target.range !== 'string' || !parseA1(target.range) || typeof action.formula !== 'string') throw new Error('AI_CAPABILITY_BLOCKED: B7 公式目标无效')
+    return 'controlled-values'
+  }
+  if (actions.length === 1 && actions[0] && CONTROLLED_MERGE_ACTIONS.includes(actions[0].type) && Array.isArray(controlledActions) && controlledActions.includes(actions[0].type)) {
+    const action = actions[0], target = action.target
+    if (action.schemaVersion !== '2.0' || !target || typeof target.sheetId !== 'string' || !target.sheetId.trim() || typeof target.range !== 'string' || !parseA1(target.range)) throw new Error('AI_CAPABILITY_BLOCKED: B8b 合并目标无效')
+    return 'controlled-values'
+  }
+  if (actions.length === 1 && actions[0] && CONTROLLED_STRUCTURE_ACTIONS.includes(actions[0].type) && Array.isArray(controlledActions) && controlledActions.includes(actions[0].type)) {
+    const action = actions[0], target = action.target
+    const axis = action.type.endsWith('Rows') ? 'row' : 'column', index = axis + (action.type.startsWith('insert') ? 'Index' : 'Position')
+    if (action.schemaVersion !== '2.0' || !target || typeof target.sheetId !== 'string' || !target.sheetId.trim() || Object.prototype.hasOwnProperty.call(target, 'range') || !Number.isInteger(action[index]) || !Number.isInteger(action.count) || action[index] < 1 || action.count < 1 || action.count > 10) throw new Error('AI_CAPABILITY_BLOCKED: B8c 行列目标无效')
+    return 'controlled-values'
+  }
+  if (actions.length === 1 && CONTROLLED_SHEET_ACTIONS.includes(actions[0]?.type) && Array.isArray(controlledActions) && controlledActions.includes(actions[0].type)) {
+    const action = actions[0], target = action.target
+    if (action.schemaVersion !== '2.0' || !target || typeof target.sheetId !== 'string' || !target.sheetId.trim() || Object.prototype.hasOwnProperty.call(target, 'range') || (action.type === 'deleteSheet' ? (action.force !== true || typeof action.fallbackSheetId !== 'string' || action.fallbackSheetId === target.sheetId) : (typeof action.newSheetName !== 'string' || !action.newSheetName.trim())) || (action.type === 'createSheet' && (!Number.isInteger(action.rowCount) || !Number.isInteger(action.columnCount)))) throw new Error('AI_CAPABILITY_BLOCKED: B8c Sheet 目标无效')
     return 'controlled-values'
   }
   let reads = false; let writes = false
@@ -192,6 +375,7 @@ export async function createOrResolveControlledRun(kind, request, send) {
 export async function submitControlledCall(workspace, call, runId, request, isCurrent) {
   if (!isCurrent()) throw new Error('页面已切换，不执行旧调用')
   const identity = { callId: call.callId, claimToken: call.claimToken, argsHash: call.argsHash, fencingToken: call.fencingToken }
+  if (call.effectId) identity.effectId = call.effectId
   const receipt = { ...identity, transportVersion: 2, ok: false }
   try { Object.assign(receipt, await workspace.applyControlled(call)) } catch (e) { receipt.error = e.message }
   const verifyFailureReply = run => {
@@ -233,6 +417,136 @@ function masked(snapshot, cells) {
 
 /** Thin transport adapter: all mutations go through the existing executeActions. Never recreates a unit. */
 export async function executeControlledWrite(univerAPI, workbook, manifest) {
+  if (manifest && manifest.structurePatch) {
+    if (manifest.structurePatch.type === 'deleteSheet') {
+      if (manifest.transportVersion !== 2 || !Array.isArray(manifest.actions) || manifest.actions.length !== 1 || manifest.cells || manifest.patch || manifest.filterPatch || manifest.formulaPatch || manifest.mergePatch || stable(manifest.action) !== stable(manifest.actions[0])) throw new Error('B8c Sheet 删除清单无效')
+      const patch = manifest.structurePatch, action = manifest.actions[0], before = plain(workbook.save())
+      if (action.type !== 'deleteSheet' || action.schemaVersion !== '2.0' || action.force !== true || patch.sheetId !== action.target?.sheetId || patch.fallbackSheetId !== action.fallbackSheetId || !workbook.getSheetBySheetId(patch.sheetId) || !workbook.getSheetBySheetId(patch.fallbackSheetId) || patch.sheetId === patch.fallbackSheetId || !sameControlledStructureTransition(before, patch.afterWorkbook, patch)) throw new Error('B8c Sheet 删除目标、确认或前置事实不一致')
+      workbook.setActiveSheet(patch.fallbackSheetId)
+      if (workbook.getActiveSheet()?.getSheetId() !== patch.fallbackSheetId || !workbook.deleteSheet(patch.sheetId)) throw new Error('RESULT_UNKNOWN: B8c Sheet 删除或保留表切换失败')
+      const after = plain(workbook.save())
+      if (workbook.getSheetBySheetId(patch.sheetId) || workbook.getActiveSheet()?.getSheetId() !== patch.fallbackSheetId || !sameControlledStructureTransition(before, after, patch)) throw new Error('RESULT_UNKNOWN: B8c Sheet 删除完整回读不一致')
+      const readback = { sheetId: patch.sheetId, type: 'deleteSheet', deleted: true, activeSheetId: patch.fallbackSheetId, workbookDigest: patch.afterDigest }
+      if (stable(readback) !== stable(manifest.structureReadback)) throw new Error('RESULT_UNKNOWN: B8c Sheet 删除回读不一致')
+      return { ok: true, structureReadback: readback }
+    }
+    if (manifest.structurePatch.type === 'renameSheet') {
+      if (manifest.transportVersion !== 2 || !Array.isArray(manifest.actions) || manifest.actions.length !== 1 || manifest.cells || manifest.patch || manifest.filterPatch || manifest.formulaPatch || manifest.mergePatch || stable(manifest.action) !== stable(manifest.actions[0])) throw new Error('B8c Sheet 重命名清单无效')
+      const patch = manifest.structurePatch, action = manifest.actions[0], before = plain(workbook.save()), sheet = workbook.getSheetBySheetId(patch.sheetId)
+      if (!sheet || action.type !== 'renameSheet' || action.schemaVersion !== '2.0' || patch.sheetId !== action.target?.sheetId || patch.newSheetName !== action.newSheetName || !sameControlledStructureTransition(before, patch.afterWorkbook, patch)) throw new Error('B8c Sheet 重命名目标或前置工作簿不一致')
+      sheet.setName(patch.newSheetName)
+      const after = plain(workbook.save())
+      if (!sameControlledStructureTransition(before, after, patch)) throw new Error('RESULT_UNKNOWN: B8c Sheet 重命名完整工作簿回读不一致')
+      const readback = { sheetId: patch.sheetId, type: 'renameSheet', newSheetName: patch.newSheetName, workbookDigest: patch.afterDigest }
+      if (stable(readback) !== stable(manifest.structureReadback)) throw new Error('RESULT_UNKNOWN: B8c Sheet 重命名回读不一致')
+      return { ok: true, structureReadback: readback }
+    }
+    if (['createSheet', 'copySheet'].includes(manifest.structurePatch.type)) {
+      if (manifest.transportVersion !== 2 || !Array.isArray(manifest.actions) || manifest.actions.length !== 1 || manifest.cells || manifest.patch || manifest.filterPatch || manifest.formulaPatch || manifest.mergePatch || stable(manifest.action) !== stable(manifest.actions[0])) throw new Error('B8c Sheet 清单无效')
+      const patch = manifest.structurePatch, action = manifest.actions[0], before = plain(workbook.save())
+      const copy = action.type === 'copySheet'
+      if (action.type !== patch.type || action.schemaVersion !== '2.0' || patch.sheetId !== action.target?.sheetId || patch.newSheetName !== action.newSheetName || (!copy && (patch.rowCount !== action.rowCount || patch.columnCount !== action.columnCount)) || !patch.newSheetId || workbook.getSheetBySheetId(patch.newSheetId) || !sameControlledStructureTransition(before, patch.afterWorkbook, patch)) throw new Error('B8c 新 Sheet 目标或前置工作簿不一致')
+      if (manifest.resultSheet === true && (!manifest.resultSource || !patch.resultData || patch.type !== 'createSheet')) throw new Error('B9 新 Sheet 来源清单无效')
+      const data = (copy || manifest.resultSheet === true) ? plain(patch.afterWorkbook.sheets[patch.newSheetId]) : { id: patch.newSheetId, rowCount: patch.rowCount, columnCount: patch.columnCount }
+      const created = workbook.insertSheet(patch.newSheetName, { index: patch.index, sheet: data })
+      if (!created || created.getSheetId() !== patch.newSheetId) throw new Error('RESULT_UNKNOWN: B8c 新 Sheet ID 不一致')
+      const after = plain(workbook.save())
+      if (!sameControlledStructureTransition(before, after, patch)) throw new Error('RESULT_UNKNOWN: B8c 新 Sheet 完整工作簿回读不一致')
+      const readback = { sheetId: patch.newSheetId, type: patch.type, rowCount: patch.rowCount, columnCount: patch.columnCount, workbookDigest: patch.afterDigest }
+      if (stable(readback) !== stable(manifest.structureReadback)) throw new Error('RESULT_UNKNOWN: B8c 新 Sheet 回读不一致')
+      return { ok: true, structureReadback: readback }
+    }
+    if (manifest.transportVersion !== 2 || !Array.isArray(manifest.actions) || manifest.actions.length !== 1 || manifest.cells || manifest.patch || manifest.filterPatch || manifest.formulaPatch || manifest.mergePatch || stable(manifest.action) !== stable(manifest.actions[0])) throw new Error('B8c 受控清单无效')
+    const patch = manifest.structurePatch, action = manifest.actions[0], sheet = workbook.getSheetBySheetId(patch.sheetId)
+    const axis = action.type.endsWith('Rows') ? 'row' : 'column', indexField = axis + (action.type.startsWith('insert') ? 'Index' : 'Position')
+    if (!sheet || !CONTROLLED_STRUCTURE_ACTIONS.includes(action.type) || patch.type !== action.type || patch.sheetId !== action.target?.sheetId || patch.count !== action.count || patch.index !== action[indexField] || patch.position !== (action.position || 'at') || (action.type.startsWith('delete') ? action.force !== true : action.force === true)) throw new Error('B8c 目标、位置、数量或删除确认不一致')
+    const before = plain(workbook.save())
+    if (!sameStructureSheet(before.sheets?.[patch.sheetId], patch.beforeSheet)) throw new Error('B8c 工作表结构已变化，保持保护')
+    const outcome = executeActions(univerAPI, workbook, [action], { continueOnError: false })
+    if (outcome.summary.failed || outcome.summary.skipped || outcome.summary.ok !== 1 || outcome.notes.length) throw new Error('RESULT_UNKNOWN: B8c 结构执行失败')
+    const after = plain(workbook.save())
+    if (!sameControlledStructureTransition(before, after, patch)) throw new Error('RESULT_UNKNOWN: B8c 结构影响区或邻区不一致')
+    const readback = { sheetId: patch.sheetId, type: patch.type, rowCount: sheet.getMaxRows(), columnCount: sheet.getMaxColumns(), sheetDigest: patch.afterDigest }
+    if (stable(readback) !== stable(manifest.structureReadback)) throw new Error('RESULT_UNKNOWN: B8c 结构回读不一致')
+    return { ok: true, structureReadback: readback }
+  }
+  if (manifest && manifest.mergePatch) {
+    if (manifest.transportVersion !== 2 || !Array.isArray(manifest.actions) || manifest.actions.length !== 1 || manifest.cells || manifest.patch || manifest.filterPatch || manifest.formulaPatch || stable(manifest.action) !== stable(manifest.actions[0])) throw new Error('B8b 受控清单无效')
+    const patch = manifest.mergePatch, action = manifest.actions[0]
+    if (!CONTROLLED_MERGE_ACTIONS.includes(action.type) || patch.type !== action.type || patch.sheetId !== action.target?.sheetId || patch.range !== action.target?.range || patch.force !== (action.force === true)) throw new Error('B8b 目标或授权不一致')
+    const sheet = workbook.getSheetBySheetId(patch.sheetId), range = parseA1(patch.range)
+    if (!sheet || !range || range.endRow >= sheet.getMaxRows() || range.endColumn >= sheet.getMaxColumns()) throw new Error('B8b 合并范围已变化')
+    const before = plain(workbook.save())
+    if (stable(mergeGeometries(before, patch.sheetId)) !== stable(patch.beforeMerges.map(mergeGeometry))) throw new Error('B8b 合并资源已变化，保持保护')
+    if (patch.type === 'merge') {
+      const removed = new Map((patch.removedCells || []).map(cell => [cell.row + ':' + cell.column, cell]))
+      for (let row = range.startRow; row <= range.endRow; row++) for (let column = range.startColumn; column <= range.endColumn; column++) {
+        if (row === range.startRow && column === range.startColumn) continue
+        const cell = before.sheets?.[patch.sheetId]?.cellData?.[row]?.[column], recorded = removed.get(row + ':' + column)
+        if (Object.keys(cell || {}).length && (!patch.force || !recorded || stable(cell) !== stable(recorded.before))) throw new Error('B8b 非主格内容未获授权，保持保护')
+        if (!Object.keys(cell || {}).length && recorded) throw new Error('B8b 内容补丁与当前单元格不一致')
+      }
+    }
+    for (const cell of patch.removedCells || []) if (stable(before.sheets?.[patch.sheetId]?.cellData?.[cell.row]?.[cell.column]) !== stable(cell.before)) throw new Error('B8b 非主格内容已变化，保持保护')
+    const outcome = executeActions(univerAPI, workbook, [action], { continueOnError: false })
+    if (outcome.summary.failed || outcome.summary.skipped || outcome.summary.ok !== 1 || outcome.notes.length) throw new Error('RESULT_UNKNOWN: B8b 合并执行失败')
+    const observed = { sheetId: patch.sheetId, range: patch.range, merges: (sheet.getMergeData?.() || []).map(merge => mergeGeometry(merge._range || merge)) }
+    const after = plain(workbook.save())
+    if (!sameControlledMergeTransition(before, after, patch) || stable(observed) !== stable(manifest.mergeReadback)) throw new Error('RESULT_UNKNOWN: B8b 合并影响区或回读不一致')
+    return { ok: true, mergeReadback: observed }
+  }
+  if (manifest && manifest.formulaPatch) {
+    if (manifest.transportVersion !== 2 || !Array.isArray(manifest.actions) || manifest.actions.length !== 1 || manifest.cells || manifest.patch || manifest.filterPatch || stable(manifest.action) !== stable(manifest.actions[0])) throw new Error('B7 受控清单无效')
+    const patch = manifest.formulaPatch, action = normalizeControlledFormulaAction(manifest.actions[0])
+    if (action.type !== 'setFormula' || patch.sheetId !== action.target?.sheetId || patch.range !== action.target?.range) throw new Error('B7 公式目标不一致')
+    const sheet = workbook.getSheetBySheetId(patch.sheetId), target = parseA1(patch.range)
+    if (!sheet || !target || target.endRow >= sheet.getMaxRows() || target.endColumn >= sheet.getMaxColumns()) throw new Error('B7 公式范围已变化')
+    const before = plain(workbook.save())
+    for (const cell of patch.cells || []) if (Object.keys(before.sheets?.[patch.sheetId]?.cellData?.[cell.row]?.[cell.column] || {}).length) throw new Error('B7 公式目标不再为空')
+    const outcome = executeActions(univerAPI, workbook, [action], { continueOnError: false })
+    if (outcome.summary.failed || outcome.summary.skipped || outcome.summary.ok !== 1 || outcome.notes.length) throw new Error('RESULT_UNKNOWN: B7 公式执行失败')
+    const observed = []
+    for (const cell of patch.cells || []) {
+      const range = sheet.getRange(toA1(cell.row, cell.column))
+      let formula, value, stored
+      for (let attempt = 0; attempt < 40; attempt++) {
+        formula = range.getFormulas?.()?.[0]?.[0]; value = range.getValues?.()?.[0]?.[0]
+        stored = workbook.save().sheets?.[patch.sheetId]?.cellData?.[cell.row]?.[cell.column]
+        if (formula === cell.formula && value === cell.value && stored?.f === cell.formula && stored?.v === cell.value && stored?.t === 2) break
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      if (formula !== cell.formula || value !== cell.value || stored?.f !== cell.formula || stored?.v !== cell.value || stored?.t !== 2) throw new Error('RESULT_UNKNOWN: B7 公式计算或缓存回读不符')
+      observed.push({ formula, value, row: cell.row, column: cell.column })
+    }
+    const after = plain(workbook.save())
+    if (!sameControlledFormulaTransition(before, after, patch) || stable(observed) !== stable(manifest.formulaReadback)) throw new Error('RESULT_UNKNOWN: B7 公式影响区或回读不一致')
+    return { ok: true, formulaReadback: observed }
+  }
+  if (manifest && manifest.filterPatch) {
+    if (manifest.transportVersion !== 2 || !Array.isArray(manifest.actions) || manifest.actions.length !== 1 || manifest.cells || manifest.patch || stable(manifest.action) !== stable(manifest.actions[0])) throw new Error('B6 受控清单无效')
+    const patch = manifest.filterPatch, action = manifest.actions[0]
+    if (!CONTROLLED_FILTER_ACTIONS.includes(action.type) || patch.type !== action.type || patch.sheetId !== action.target?.sheetId || patch.range !== action.target?.range) throw new Error('B6 受控目标不一致')
+    const before = plain(workbook.save())
+    if (stable(filterData(before)) !== stable(patch.beforeData ? JSON.parse(patch.beforeData) : {})) throw new Error('B6 筛选资源已变化，保持保护')
+    const sheet = workbook.getSheetBySheetId(patch.sheetId), range = parseA1(patch.range)
+    if (!sheet || !range || range.endRow >= sheet.getMaxRows() || range.endColumn >= sheet.getMaxColumns()) throw new Error('B6 筛选范围已变化')
+    const outcome = executeActions(univerAPI, workbook, [action], { continueOnError: false })
+    if (outcome.summary.failed || outcome.summary.skipped || outcome.summary.ok !== 1) throw new Error('RESULT_UNKNOWN: B6 筛选执行失败')
+    const filter = typeof sheet.getFilter === 'function' ? sheet.getFilter() : null
+    const expected = patch.filter
+    if (!!filter !== !!expected) throw new Error('RESULT_UNKNOWN: B6 Filter 实际状态不符')
+    if (filter) {
+      if (filter.getRange?.().getA1Notation?.() !== patch.range) throw new Error('RESULT_UNKNOWN: B6 Filter 范围回读不符')
+      const columns = expected.filterColumns || []
+      for (const criterion of columns) if (stable(filter.getColumnFilterCriteria?.(range.startColumn + criterion.colId)) !== stable(criterion)) throw new Error('RESULT_UNKNOWN: B6 筛选条件回读不符')
+      if (stable(filter.getFilteredOutRows?.()) !== stable(expected.cachedFilteredOut)) throw new Error('RESULT_UNKNOWN: B6 可见结果回读不符')
+    }
+    const after = plain(workbook.save())
+    if (!sameControlledFilterTransition(before, after, patch)) throw new Error('RESULT_UNKNOWN: B6 目标外资源或内容发生变化')
+    const readback = { sheetId: patch.sheetId, range: patch.range, hasFilter: !!filter, filter: expected }
+    if (stable(readback) !== stable(manifest.filterReadback)) throw new Error('RESULT_UNKNOWN: B6 回读与可信清单不符')
+    return { ok: true, filterReadback: readback }
+  }
   if (manifest && manifest.patch) {
     if (manifest.transportVersion !== 2 || !Array.isArray(manifest.actions) || manifest.actions.length !== 1 || manifest.cells || stable(manifest.action) !== stable(manifest.actions[0])) throw new Error('B5受控清单无效')
     const patch = manifest.patch, action = manifest.actions[0]
