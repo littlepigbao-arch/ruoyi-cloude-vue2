@@ -1,0 +1,51 @@
+// Run real source methods with Vue's reactive watchers and in-memory boundaries.
+// This is not a real-browser / MySQL end-to-end test.
+const fs=require('fs'),path=require('path'),vm=require('vm'),assert=require('assert');
+const root=path.resolve(__dirname,'../..');
+const babel=require(path.join(root,'node_modules/@babel/core'));
+const plugin=require(path.join(root,'node_modules/@babel/plugin-transform-modules-commonjs'));
+const Vue=require(path.join(root,'node_modules/vue'));
+const sourceRoot=process.env.A1_SOURCE_ROOT||root;
+const dir=path.join(sourceRoot,'src/views/application/agentReport');
+let downloads=[];const realXlsx=require(path.join(root,'node_modules/xlsx'));
+let api={},wbApi={},storage=new Map(),cache=new Map(),failures=0,passed=0;
+function load(file){
+ if(cache.has(file))return cache.get(file);
+ let src=fs.readFileSync(file,'utf8');if(file.endsWith('.vue'))src=src.match(/<script>([\s\S]*?)<\/script>/)[1];
+ const module={exports:{}};
+ const code=babel.transformSync(src,{configFile:false,babelrc:false,plugins:[plugin]}).code;
+ vm.runInNewContext(code,{module,exports:module.exports,console,performance,Blob,sessionStorage:{setItem:(k,v)=>storage.set(k,v)},
+ setTimeout:()=>0,clearTimeout:()=>{},setInterval:()=>0,clearInterval:()=>{},
+ require:name=>{
+  if(name==='xlsx')return realXlsx; if(name==='file-saver')return{saveAs:(blob,name)=>downloads.push({blob,name})};
+  if(name==='@/api/ai/agent')return new Proxy({}, {get:(_,k)=>api[k]});
+  if(name==='@/api/ai/workbook')return new Proxy({}, {get:(_,k)=>wbApi[k]});
+  if(name.startsWith('.')){const target=path.resolve(path.dirname(file),name+(path.extname(name)?'':'.js'));if(target.endsWith('.vue')&&!target.endsWith('AgentTaskPanel.vue'))return {};return load(target);}
+  return {};
+ }},{filename:file});cache.set(file,module.exports);return module.exports;
+}
+const clone=x=>JSON.parse(JSON.stringify(x))
+const sample=()=>({id:'export',name:'测试',sheetOrder:['s','other'],styles:{money:{n:{pattern:'0.00'},bg:{rgb:'#123456'}}},resources:[{name:'future-resource',data:'keep'}],sheets:{s:{id:'s',name:'数据',rowCount:100001,columnCount:120,cellData:{0:{0:{v:0,t:2},1:{v:false,t:3},2:{v:'001',t:1},3:{v:'',t:1},4:{f:'=A1+2',v:2,t:2},5:{v:'literal =SUM(A1)',t:1},6:{p:{body:{dataStream:'富文本\r\n',textRuns:[{st:0,ed:2,ts:{bl:1}}]}}},7:{f:'=1/0',v:'#DIV/0!'},8:{v:1.25,s:'money'},9:{f:'=SUM(A1:B1)'}}},mergeData:[{startRow:2,endRow:2,startColumn:0,endColumn:2}],rowData:{0:{h:35},1:{hd:1}},columnData:{0:{w:90},1:{hd:1}}},other:{id:'other',name:'隐藏',hidden:1,cellData:{0:{0:{v:'second'}}}}}})
+function page(){const c=load(path.join(dir,'index.vue')).default,p=c.data();for(const[k,v]of Object.entries(c.methods))p[k]=v.bind(p);p.snapshot=sample();p.errors=[];p.successes=[];Object.assign(p,{hasData:true,currentDocumentId:7,currentBranchId:8,currentDocumentVersion:9,loadedRevision:'hash',currentDocumentName:'文档/:*名称',univerAPI:{getActiveWorkbook:()=>({save:()=>p.snapshot})},$modal:{msgError:e=>p.errors.push(e),msgWarning:e=>p.errors.push(e),msgSuccess:e=>p.successes.push(e)}});return p}
+const read=book=>realXlsx.read(realXlsx.write(book,{type:'array',bookType:'xlsx'}),{type:'array',cellStyles:true,cellNF:true,sheetStubs:true})
+async function test(name,fn){downloads=[];try{await fn();passed++;console.log('PASS '+name)}catch(e){failures++;console.error('FAIL '+name+': '+e.stack)}}
+;(async()=>{
+await test('Real XLSX roundtrip preserves scalar types formula caches merges hidden sheets and dimensions',()=>{const p=page(),before=JSON.stringify(p.snapshot),book=read(p.convertUniverSnapshotToXlsx(p.snapshot)),ws=book.Sheets['数据'];assert.equal(ws.A1.v,0);assert.equal(ws.A1.t,'n');assert.equal(ws.B1.v,false);assert.equal(ws.B1.t,'b');assert.equal(ws.C1.v,'001');assert.equal(ws.C1.t,'s');assert.equal(ws.D1.v,'');assert.equal(ws.E1.f,'A1+2');assert.equal(ws.E1.v,2);assert.equal(ws.F1.v,'literal =SUM(A1)');assert.equal(ws.G1.v,'富文本');assert.equal(ws.H1.t,'e');assert.equal(ws.H1.v,7);assert.equal(ws.I1.z,'0.00');assert.equal(ws.J1.f,'SUM(A1:B1)');assert.equal(book.Workbook.Sheets[1].Hidden,1);assert.equal(ws['!merges'][0].e.c,2);assert.equal(ws['!rows'][0].hpx,35);assert.equal(ws['!rows'][1].hidden,true);assert.equal(ws['!cols'][1].hidden,true);assert.equal(JSON.stringify(p.snapshot),before)})
+await test('Sparse coordinates beyond old truncation limits survive both axes',()=>{const p=page(),s=sample();s.sheetOrder=['s'];delete s.sheets.other;Object.assign(s.sheets.s,{cellData:{100000:{104:{v:'DA100001'}}},mergeData:[],rowData:{},columnData:{}});const ws=read(p.convertUniverSnapshotToXlsx(s)).Sheets['数据'];assert.equal(ws.DA100001.v,'DA100001');assert.equal(ws['!ref'],'DA100001')})
+await test('Configured blank row/column capacity does not expand export range',()=>{const p=page(),s=sample();s.sheets.s.rowCount=1048576;s.sheets.s.columnCount=16384;const ws=p.convertUniverSnapshotToXlsx(s).Sheets['数据'];assert.equal(ws['!ref'],'A1:J3')})
+await test('Oversized serializer range and out-of-capacity cells reject without clipping',()=>{const p=page();for(const cells of [{0:{0:{v:1}},100000:{104:{v:2}}},{1048576:{0:{v:1}}},{0:{16384:{v:1}}}]){const s=sample();s.sheets.s.cellData=cells;assert.throws(()=>p.convertUniverSnapshotToXlsx(s),/预算|容量/)}})
+await test('Invalid duplicate truncated sheet names reject rather than renaming silently',()=>{const p=page();for(const name of ['a'.repeat(32),'bad/name',"'bad",'数据']){const s=sample();s.sheets.other.name=name;assert.throws(()=>p.convertUniverSnapshotToXlsx(s),/名称/)}const s=sample();s.sheets.s.name='Alpha';s.sheets.other.name='alpha';assert.throws(()=>p.convertUniverSnapshotToXlsx(s),/名称/)})
+await test('Missing duplicated or incomplete sheet order stops export',()=>{const p=page();for(const order of [['s'],['s','s'],['s','bad'],[]]){const s=sample();s.sheetOrder=order;assert.throws(()=>p.convertUniverSnapshotToXlsx(s))}const s=sample();delete s.sheetOrder;assert.equal(p.convertUniverSnapshotToXlsx(s).SheetNames.length,2)})
+await test('Invalid merge bounds or overlapping merges reject before download',()=>{const p=page();for(const merge of [{startRow:2,endRow:1,startColumn:0,endColumn:1},{startRow:0,endRow:1,startColumn:-1,endColumn:1}]){const s=sample();s.sheets.s.mergeData=[merge];assert.throws(()=>p.convertUniverSnapshotToXlsx(s))}const s=sample();s.sheets.s.mergeData.push(clone(s.sheets.s.mergeData[0]));assert.throws(()=>p.convertUniverSnapshotToXlsx(s),/重叠/)})
+await test('Empty sheets remain exportable; all hidden sheets are rejected',()=>{const p=page(),s={sheets:{s:{name:'Empty'}},sheetOrder:['s']};assert.equal(read(p.convertUniverSnapshotToXlsx(s)).SheetNames[0],'Empty');s.sheets.s.hidden=1;assert.throws(()=>p.convertUniverSnapshotToXlsx(s),/可见/)})
+await test('Nonfinite invalid rich text and nonprimitive values fail without false success',()=>{const p=page();for(const cell of [{v:Infinity},{v:{bad:1}},{p:{}},{f:'='}]){const s=sample();s.sheets.s.cellData={0:{0:cell}};assert.throws(()=>p.convertUniverSnapshotToXlsx(s))}})
+await test('Export is read-only even when exporting a protected or historical page',async()=>{for(const field of ['agentLocked','agentSyncRequired','historyPreview']){downloads=[];const p=page();p[field]=true;const before=JSON.stringify([p.currentDocumentId,p.currentBranchId,p.currentDocumentVersion,p.loadedRevision,p.snapshot]);p.handleExport();assert.equal(downloads.length,1);const ws=realXlsx.read(await downloads[0].blob.arrayBuffer(),{type:'array'}).Sheets['数据'];assert.equal(ws.B1.v,false);assert(!/[/:*]/.test(downloads[0].name));assert.equal(JSON.stringify([p.currentDocumentId,p.currentBranchId,p.currentDocumentVersion,p.loadedRevision,p.snapshot]),before)}})
+await test('Busy applying suspended or parsing page emits no download',()=>{for(const field of ['persistBusy','agentApplying','aiExecutionInProgress','suspendChangeCapture','pendingExcelImport']){const p=page();p[field]=true;p.handleExport();p.handleSnapshotExport();assert.equal(downloads.length,0);assert(p.errors.length)}})
+await test('Complete export never uses truncated manualSnapshot fallback',()=>{const p=page();let fallback=0;p.univerAPI={getActiveWorkbook:()=>({save(){throw Error('save unavailable')}})};p.manualSnapshot=()=>{fallback++;return sample()};p.handleExport();p.handleSnapshotExport();assert.equal(fallback,0);assert.equal(downloads.length,0);assert.equal(p.successes.length,0)})
+await test('Raw JSON backup preserves unsupported resources styles order and rich document',async()=>{const p=page();p.snapshot.sheets.s.cellData[100000]={104:{v:'far'}};p.handleSnapshotExport();assert.equal(downloads.length,1);const content=JSON.parse(await downloads[0].blob.text());assert.deepStrictEqual(content,p.snapshot);assert(downloads[0].name.endsWith('.snapshot.json'))})
+await test('Fresh XLSX import maps types and normalized formula prefixes correctly',()=>{const p=page(),book=read(p.convertUniverSnapshotToXlsx(p.snapshot)),imported=p.convertXlsxWorkbookToUniverData(book,'roundtrip.xlsx'),cells=imported.sheets['sheet-0'].cellData;assert.equal(cells[0][0].t,2);assert.equal(cells[0][1].t,3);assert.equal(cells[0][2].t,1);assert.equal(cells[0][4].f,'=A1+2');assert.equal(cells[0][4].v,2);assert.equal(cells[0][7].v,'#DIV/0!')})
+await test('Lucky converter normalizes formula prefixes and zero false types',()=>{const p=page(),data=p.convertLuckyJsonToUniver({sheets:[{name:'Old',celldata:[{r:0,c:0,v:{v:0}},{r:0,c:1,v:{v:false}},{r:0,c:2,v:{v:2,f:'A1+2'}}]}]},'legacy.xlsx').sheets['sheet-0'].cellData;assert.equal(data[0][0].t,2);assert.equal(data[0][1].t,3);assert.equal(data[0][2].f,'=A1+2')})
+await test('Shared formulas and combined workbook serializer budget reject explicitly',()=>{const p=page(),shared=sample();shared.sheets.s.cellData[0][0]={v:2,si:'shared-id'};assert.throws(()=>p.convertUniverSnapshotToXlsx(shared),/共享公式/);const s=sample();for(const id of s.sheetOrder)Object.assign(s.sheets[id],{cellData:{0:{0:{v:1}},4999:{1199:{v:2}}},mergeData:[],rowData:{},columnData:{}});assert.throws(()=>p.convertUniverSnapshotToXlsx(s),/整个工作簿/)})
+console.log(JSON.stringify({passed,failures,realXlsx:true,realBrowser:false}));process.exitCode=failures?1:0
+})().catch(e=>{console.error(e);process.exitCode=1})
+

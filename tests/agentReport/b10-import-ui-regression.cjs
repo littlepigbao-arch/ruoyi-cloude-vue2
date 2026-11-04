@@ -1,0 +1,54 @@
+// Run real source methods with Vue's reactive watchers and in-memory boundaries.
+// This is not a real-browser / MySQL end-to-end test.
+const fs=require('fs'),path=require('path'),vm=require('vm'),assert=require('assert');
+const root=path.resolve(__dirname,'../..');
+const babel=require(path.join(root,'node_modules/@babel/core'));
+const plugin=require(path.join(root,'node_modules/@babel/plugin-transform-modules-commonjs'));
+const Vue=require(path.join(root,'node_modules/vue'));
+const sourceRoot=process.env.A1_SOURCE_ROOT||root;
+const dir=path.join(sourceRoot,'src/views/application/agentReport');
+let readers=[],luckyCalls=[];const realXlsx=require(path.join(root,'node_modules/xlsx'));const luckyMock={transformExcelToLucky:(file,success,error)=>luckyCalls.push({file,success,error})};class Reader{constructor(){this.readyState=0;readers.push(this)}readAsArrayBuffer(){this.readyState=1}abort(){this.aborted=true;this.readyState=2;if(this.onabort)this.onabort()}fire(result){this.readyState=2;this.onload({target:{result}})}};
+let api={},wbApi={},storage=new Map(),cache=new Map(),failures=0,passed=0;
+function load(file){
+ if(cache.has(file))return cache.get(file);
+ let src=fs.readFileSync(file,'utf8');if(file.endsWith('.vue'))src=src.match(/<script>([\s\S]*?)<\/script>/)[1];
+ const module={exports:{}};
+ const code=babel.transformSync(src,{configFile:false,babelrc:false,plugins:[plugin]}).code;
+ vm.runInNewContext(code,{module,exports:module.exports,console,performance,Blob,FileReader:Reader,sessionStorage:{setItem:(k,v)=>storage.set(k,v)},
+ setTimeout:()=>0,clearTimeout:()=>{},setInterval:()=>0,clearInterval:()=>{},
+ require:name=>{
+  if(name==='xlsx')return realXlsx; if(name==='luckyexcel')return luckyMock;
+  if(name==='@/api/ai/agent')return new Proxy({}, {get:(_,k)=>api[k]});
+  if(name==='@/api/ai/workbook')return new Proxy({}, {get:(_,k)=>wbApi[k]});
+  if(name.startsWith('.')){const target=path.resolve(path.dirname(file),name+(path.extname(name)?'':'.js'));if(target.endsWith('.vue')&&!target.endsWith('AgentTaskPanel.vue'))return {};return load(target);}
+  return {};
+ }},{filename:file});cache.set(file,module.exports);return module.exports;
+}
+const sample=()=>({id:'sample',name:'book',sheetOrder:['s'],sheets:{s:{id:'s',name:'Sheet1',cellData:{0:{0:{v:'old'}}}}}})
+const defer=()=>{let resolve;const promise=new Promise(r=>{resolve=r});return{promise,resolve}}
+function page(){const c=load(path.join(dir,'index.vue')).default,p=c.data();for(const[k,v]of Object.entries(c.methods))p[k]=v.bind(p);p.snapshot=sample();p.errors=[];p.successes=[];p.backups=[];p.saved=0;p.loaded=0;Object.assign(p,{currentDocumentId:1,currentBranchId:2,headCommitId:'h',branchVersion:4,draftVersion:7,loadedRevision:'loaded',workspaceGeneration:1,currentDocumentVersion:9,univer:{},univerAPI:{},getSnapshot:()=>p.snapshot,loadUniverWorkbook:s=>{p.snapshot=s;p.loaded++},preserveLocalDraft:force=>{p.backups.push({force,snapshot:p.snapshot})},saveCurrentWorkbook:()=>{p.saved++;return Promise.resolve()},uniqueName:n=>n,$modal:{msgError:e=>p.errors.push(e),msgWarning:e=>p.errors.push(e),msgSuccess:e=>p.successes.push(e)},fetchDocuments(){},flushManualChanges(){}});return p}
+const file={name:'import.xlsx',size:200,type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}
+const sourceBook=realXlsx.utils.book_new();realXlsx.utils.book_append_sheet(sourceBook,realXlsx.utils.aoa_to_sheet([['Name','Value'],['zero',0],['false',false]]),'Imported');const bytes=realXlsx.write(sourceBook,{type:'array',bookType:'xlsx'})
+const luckyResult={sheets:[{name:'Fallback',rowCount:10,columnCount:10,celldata:[{r:0,c:0,v:{v:'fallback'}}]}]}
+async function test(name,fn){readers=[];luckyCalls=[];try{await fn();passed++;console.log('PASS '+name)}catch(e){failures++;console.error('FAIL '+name+': '+e.stack)}}
+const assertOld=p=>{assert.equal(p.loaded,0);assert.equal(p.saved,0);assert.equal(p.currentDocumentId,1);assert.equal(p.snapshot.sheets.s.cellData[0][0].v,'old')}
+;(async()=>{
+await test('Actual XLSX parser imports new workbook once and preserves source first',()=>{const p=page();p.importExcelWithXLSX(file);readers[0].fire(bytes);assert.equal(p.loaded,1);assert.equal(p.saved,1);assert.equal(p.currentDocumentId,null);assert.equal(p.currentDocumentType,'imported');assert.equal(p.backups.length,1);assert(p.backups[0].force);const cells=p.snapshot.sheets['sheet-0'].cellData;assert.equal(cells[1][1].v,0);assert.equal(cells[2][1].v,false);readers[0].fire(bytes);assert.equal(p.loaded,1)})
+await test('Invalid file and locked/busy/preview/unreconciled entry start no reader',()=>{for(const state of ['agentLocked','persistBusy','historyPreview','agentSyncRequired']){const p=page();p[state]=true;p.handleFileChange({raw:file});assertOld(p)}const p=page();p.importExcelWithXLSX({...file,name:'bad.txt',type:'text/plain'});p.importExcelWithXLSX({...file,size:10*1024*1024});assert.equal(readers.length,0)})
+await test('Late read after document/branch/generation change cannot parse or replace',()=>{for(const field of ['currentDocumentId','currentBranchId','workspaceGeneration']){const p=page();p.importExcelWithXLSX(file);const r=readers.at(-1);p[field]++;r.fire(bytes);assert.equal(p.loaded,0);assert.equal(p.saved,0);assert.equal(p.snapshot.sheets.s.cellData[0][0].v,'old')}})
+await test('Lock onset invalidates even if task later unlocks',()=>{const p=page();p.importExcelWithXLSX(file);p.lockAgentWorkspace(true);p.lockAgentWorkspace(false);readers[0].fire(bytes);assertOld(p);assert(readers[0].aborted)})
+await test('Persist onset invalidates even after it completes',async()=>{const p=page();p.nextUiFrame=async()=>{};p.importExcelWithXLSX(file);await p.runPersistTask('test',async()=>{});p.persistBusy=false;readers[0].fire(bytes);assertOld(p)})
+await test('New edits during read are retained and import is cancelled',()=>{const p=page();p.importExcelWithXLSX(file);p.snapshot.sheets.s.cellData[0][0].v='new-edit';readers[0].fire(bytes);assert.equal(p.loaded,0);assert.equal(p.saved,0);assert.equal(p.snapshot.sheets.s.cellData[0][0].v,'new-edit')})
+await test('Changed draft baseline rejects even unchanged snapshot',()=>{for(const field of ['loadedRevision','draftVersion','branchVersion','headCommitId']){const p=page();p.importExcelWithXLSX(file);p[field]=String(p[field])+'changed';readers.at(-1).fire(bytes);assertOld(p)}})
+await test('New file supersedes old read and old error without notifications',()=>{const p=page();p.importExcelWithXLSX(file);const old=readers[0];p.importExcelWithXLSX({...file,name:'new.xlsx'});const errors=p.errors.length;old.fire(bytes);old.onerror();assert.equal(p.errors.length,errors);readers[1].fire(bytes);assert.equal(p.loaded,1);assert.equal(p.currentDocumentName,'new.xlsx')})
+await test('Only parser/converter error enters fallback and consumes once',()=>{const p=page();p.convertXlsxWorkbookToUniverData=()=>{throw Error('primary conversion')};p.importExcelWithXLSX(file);readers[0].fire(bytes);assert.equal(luckyCalls.length,1);luckyCalls[0].success(luckyResult);luckyCalls[0].success(luckyResult);luckyCalls[0].error(Error('late'));assert.equal(p.loaded,1);assert.equal(p.saved,1);assert.equal(p.errors.length,0)})
+await test('Fallback callbacks and errors after task/workspace changes are ignored',()=>{for(const mode of ['lock','switch','newer']){const p=page();p.importExcelWithLuckyExcel(file);const old=luckyCalls.at(-1);if(mode==='lock'){p.lockAgentWorkspace(true);p.lockAgentWorkspace(false)}else if(mode==='switch')p.workspaceGeneration++;else p.importExcelWithXLSX({...file,name:'other.xlsx'});old.success(luckyResult);old.error(Error('stale'));assertOld(p);assert.equal(p.errors.length,0)}})
+await test('Fallback current failure leaves page intact and retry works',()=>{const p=page();p.importExcelWithLuckyExcel(file);luckyCalls[0].error(Error('invalid zip'));assertOld(p);assert.equal(p.pendingExcelImport,null);assert(p.errors.some(e=>e.includes('invalid zip')));p.importExcelWithLuckyExcel(file);luckyCalls[1].success(luckyResult);assert.equal(p.loaded,1)})
+await test('Read failure and unavailable engine do not replace or fallback',()=>{const p=page();p.importExcelWithXLSX(file);readers[0].onerror();assertOld(p);p.importExcelWithXLSX(file);p.univer=null;readers[1].fire(bytes);assertOld(p);assert.equal(luckyCalls.length,0)})
+await test('Local backup quota failure prevents load/save and does not retry another parser',()=>{const p=page();p.preserveLocalDraft=()=>{throw Error('quota')};p.importExcelWithXLSX(file);readers[0].fire(bytes);assertOld(p);assert.equal(luckyCalls.length,0);assert(p.errors.some(e=>e.includes('quota')))})
+await test('SDK creation failure retains backup and protects workspace without fallback',()=>{const p=page();p.loadUniverWorkbook=()=>{throw Error('SDK')};p.importExcelWithXLSX(file);readers[0].fire(bytes);assert.equal(p.backups.length,1);assert.equal(p.saved,0);assert(p.agentLocked&&p.agentSyncRequired);assert.equal(luckyCalls.length,0);assert.equal(p.currentDocumentId,1)})
+await test('Destroyed page invalidates pending fallback',()=>{const p=page(),c=load(path.join(dir,'index.vue')).default;p.disposeUniver=()=>{};p.importExcelWithLuckyExcel(file);c.beforeDestroy.call(p);luckyCalls[0].success(luckyResult);assertOld(p)})
+await test('New document creation checks identity before HTTP after UI frame',async()=>{const p=page(),c=load(path.join(dir,'index.vue')).default;p.saveCurrentWorkbook=c.methods.saveCurrentWorkbook.bind(p);p.currentDocumentId=null;p.currentBranchId=null;p.hasData=true;const d=defer();p.nextUiFrame=()=>d.promise;let calls=0;wbApi.saveWorkbook=async()=>{calls++;return{code:200,data:{workbookId:99}}};const job=p.saveCurrentWorkbook(false);p.resetVersionState();d.resolve();await job;assert.equal(calls,0);assert.equal(p.currentDocumentId,null)})
+await test('Lost creation response cannot stamp another workspace or changed edits',async()=>{for(const mode of ['switch','edit']){const p=page(),c=load(path.join(dir,'index.vue')).default;p.saveCurrentWorkbook=c.methods.saveCurrentWorkbook.bind(p);p.currentDocumentId=null;p.currentBranchId=null;p.hasData=true;p.nextUiFrame=async()=>{};const d=defer();wbApi.saveWorkbook=()=>d.promise;const job=p.saveCurrentWorkbook(false);for(let i=0;i<8;i++)await Promise.resolve();if(mode==='switch'){p.currentDocumentId=88;p.workspaceGeneration++}else p.snapshot.sheets.s.cellData[0][0].v='new-edit';d.resolve({code:200,data:{workbookId:99,name:'old-import',type:'imported',version:1}});await job;assert.notEqual(p.currentDocumentId,99);if(mode==='edit')assert.equal(p.snapshot.sheets.s.cellData[0][0].v,'new-edit');assert(p.errors.some(e=>e.includes('99')))}})
+console.log(JSON.stringify({passed,failures,realBrowser:false,realXlsx:true,realLuckyExcel:false}));process.exitCode=failures?1:0
+})().catch(e=>{console.error(e);process.exitCode=1})
