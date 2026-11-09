@@ -88,6 +88,22 @@ export const constantRoutes = [
     hidden: true,
     meta: { title: 'AI 表格助手' }
   },
+  // ===== C3 导入链路验收专页（独立 harness，不走 Layout、不进主页面） =====
+  {
+    path: '/agent-report-import-acceptance',
+    component: () => import('@/views/application/agentReport/ImportAcceptance'),
+    name: 'AgentReportImportAcceptance',
+    hidden: true,
+    meta: { title: 'C3 导入链路验收' }
+  },
+  // ===== C3 公式重算策略探针（真实 UI 插件栈诊断，同时作为浏览器回归装置） =====
+  {
+    path: '/agent-report-formula-probe',
+    component: () => import('@/views/application/agentReport/FormulaProbe'),
+    name: 'AgentReportFormulaProbe',
+    hidden: true,
+    meta: { title: 'Univer 公式重算探针' }
+  },
   {
     path: '/user',
     component: Layout,
